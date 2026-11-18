@@ -1,0 +1,50 @@
+# Prompt config for SFT, RL and distillation data.
+# Native Qwen3.5 chat template, no system prompt. One format line per task_type appended to the user turn.
+# Loaded by m3opd/prompts.py (default). Never change in place once a dataset is built with it.
+id: prompt
+system_prompt: null
+separator: "\n\n"                  # between the question and the format line
+
+# enable_thinking per domain (chat_template_kwargs; verl extra_info.thinking at export). A row's meta.thinking
+# overrides this. SFT targets without a reasoning trace render as "<think>\n\n</think>\n\n<answer>" in the
+# Qwen3.5 template whatever this flag says (the template always opens the last assistant turn with a think block).
+thinking:
+  sft0: false                     # sft0 converters write meta.thinking=false (no <think>)
+  imgr: true
+  imgp: true
+  vid: true
+  if: true                        # rows without a trace train an empty think block
+thinking_default: true
+thinking_off_task_types: []       # absent key = [if]: task_type `if` off when the domain is not listed
+
+# One line per task_type. Empty string = no line (free-form answer).
+format_lines:
+  mc: "Answer with the option letter only, inside \\boxed{}."
+  math: "Put your final answer within \\boxed{}."
+  count: "Put your final answer as a single integer within \\boxed{}."
+  short: "Put your final short answer within \\boxed{}."
+  ocr: "Put the exact text of your final answer within \\boxed{}."
+  ground: "Output the box as [x1, y1, x2, y2] in 0-1000 relative coordinates inside \\boxed{}."
+  tground: "Output the segment as [start, end] in seconds inside \\boxed{}."
+  if: ""
+  chat: ""
+  caption: ""
+
+# Answer-format instructions already in source questions. Removed before the format line is added
+# (case-insensitive, applied in order). Keep these specific: they run on every training prompt.
+strip_patterns:
+  # Format instructions that ask for <think>/<answer> tags or an empty \boxed{} (R1-style templates,
+  # Video-R1, MM-Eureka). Both need an instruction verb before the tag; \boxed must be empty (\boxed{x} in
+  # an option is question content). A sentence ends only at . ? ! before a space or line end (3.5 is not).
+  # 1) trailing clause: 'Solve 2x=4 and put your answer in \boxed{}.' -> 'Solve 2x=4.'
+  - ',?[ \t]*\b(?:and|then|if (?:we|you))[ \t]+(?:please[ \t]+)?(?:put|plac\w*|enclos\w*|wrap\w*|writ\w*|output\w*|provid\w*|giv\w*|format\w*|present\w*|return\w*|includ\w*|respond\w*|mark\w*)\b(?:[^\n.?!]|[.?!](?!\s|$))*?(?:</?think>|</?answer>|\\boxed(?!\s*\{\s*[^\s}]))(?:[^\n.?!]|[.?!](?!\s|$))*'
+  # 2) whole instruction sentence: 'The final answer MUST BE put in \boxed{}.'
+  - '(?:^|(?<=[.?!]))[ \t]*(?:[^\n.?!]|[.?!](?!\s|$))*?\b(?:put|plac\w*|enclos\w*|wrap\w*|writ\w*|output\w*|provid\w*|giv\w*|format\w*|present\w*|return\w*|includ\w*|respond\w*|mark\w*)\b(?:[^\n.?!]|[.?!](?!\s|$))*?(?:</?think>|</?answer>|\\boxed(?!\s*\{\s*[^\s}]))(?:[^\n.?!]|[.?!](?!\s|$))*(?:[.?!]|$)'
+  - 'answer with the option''?s? letter from the given choices directly\.?'
+  - 'answer with the letter of the correct option\.?'
+  - 'please answer directly with only the letter of the correct option and nothing else\.?'
+  - 'answer the question using a single word or phrase\.?'
+  - 'answer the question with a single word or phrase\.?'
+  - 'please reason step by step[^\n.]*\.?'
+  - 'let''s think step by step\.?'
+  - 'please provide the (?:final )?answer (?:only|directly)\.?'

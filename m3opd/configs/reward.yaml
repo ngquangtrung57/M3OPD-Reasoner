@@ -1,0 +1,46 @@
+# Rule reward config, default of m3opd/reward/score.py.
+# Robust matching for every task type:
+#   all types  one cleanup of prediction and gold (types.clean_answer): $..$, **..**, quotes, \text{}/\mathrm{} anywhere,
+#              'The answer is', trailing period, \%, ^\circ / ° / \degree, LaTeX spacing, \left/\right
+#   math/short units must agree when both sides give one (5 kg != 5 cm, 10 rad != 10°), a missing unit is accepted,
+#              % <-> decimal; a stated relation ('\geq 5', '> 3') never matches a plain value; multi-part answers
+#              match part by part with the same part count; number words; option-letter golds take letter forms;
+#              math_verify matches on golds with text it can not parse also need the same numbers and +/-/= sequence
+#   mc         option-letter sets ('B, D', '(B) and (D)', 'BD' for multi golds); 'D. text and A' = two letters;
+#              a non-letter gold is scored as short
+#   count      '7 birds', 'about 7', 'seven'; a non-integer gold is scored as short
+#   ocr        digit guard: different digit sequences score 0 (ANLS otherwise)
+#   ground     '(x1,y1),(x2,y2)', <box> / <|box_start|> tags, x1=.., four bare numbers, 0-1 coords rescaled;
+#              point golds (and zero-area boxes): within point_radius or inside the predicted box;
+#              several boxes: Hungarian IoU sum / max(n_pred, n_gt)
+#   tground    mm:ss, start/end keys, ~ -- → \to 'between .. and ..'; several predicted segments: matched tIoU / max(n)
+# R = w_acc*acc + w_fmt*fmt; acc is forced to 0 when fmt < 1 (acc_requires_full_fmt).
+id: reward
+weights: {acc: 0.9, fmt: 0.1}
+
+format:
+  require_nonempty_think: true
+  allow_leading_think_tag: true
+  partial_box_score: 0.5
+  acc_requires_full_fmt: true
+  boxed_task_types: [mc, math, count, short, ocr, ground, tground]
+
+limits:
+  max_answer_chars: 300            # payload cap before math_verify; a gold longer than 150 chars raises it to 2 x len(gold)
+  math_timeout_s: 3
+  math_workers: 4
+  math_hard_timeout_s: 20
+
+types:
+  math: {float_rounding: 6, numeric_precision: 15}
+  short: {numeric_fallback: true}
+  ocr: {anls_threshold: 0.5, digit_guard: true}
+  ground:
+    coord_scale: 1000
+    aggregate: matched                               # Hungarian IoU sum / max(n_pred, n_gt)
+    point_radius: 20                                 # point golds, 0-1000 units (2 % of the image side)
+    iou_threshold: 0.5                               # used by aggregate: vero only
+    weights: {location: 1.0, recall: 0.75, penalty: 0.5}
+    normalize: true
+  tground: {multi_pred: true}
+  if: {unknown_counts_as_fail: true, aggregate: all}

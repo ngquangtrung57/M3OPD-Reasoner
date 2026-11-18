@@ -1,0 +1,656 @@
+diff --git a/src/lmms_engine/datasets/config.py b/src/lmms_engine/datasets/config.py
+index b37be49..935dd92 100644
+--- a/src/lmms_engine/datasets/config.py
++++ b/src/lmms_engine/datasets/config.py
+@@ -36,13 +36,15 @@ class DatasetConfig(Args):
+     video_max_pixels: Optional[int] = 768 * 28 * 28
+     video_max_frames: Optional[int] = 768
+     video_min_pixels: Optional[int] = 3136
++    video_min_frames: Optional[int] = 1  # lower bound of the sampled frame count (was hardcoded 1)
+     frame_num: Optional[int] = 64
+-    fps: Optional[int] = 1
++    fps: Optional[float] = 1  # float (fractional fps was truncated)
+     video_backend: Optional[Literal["decord", "qwen_vl_utils", "qwen_omni_utils", "lmms_video_utils"]] = "qwen_vl_utils"
+ 
+     @field_validator(
+         "video_max_pixels",
+         "video_max_frames",
++        "video_min_frames",
+         "frame_num",
+         "fps",
+         "packing_length",
+diff --git a/src/lmms_engine/datasets/iterable/qwen3_vl_iterable_dataset.py b/src/lmms_engine/datasets/iterable/qwen3_vl_iterable_dataset.py
+index 95d2434..8735110 100644
+--- a/src/lmms_engine/datasets/iterable/qwen3_vl_iterable_dataset.py
++++ b/src/lmms_engine/datasets/iterable/qwen3_vl_iterable_dataset.py
+@@ -5,6 +5,7 @@ from typing import Dict, Tuple
+ import numpy as np
+ import torch
+ from PIL import Image
++from loguru import logger
+ from qwen_vl_utils import fetch_video
+ 
+ from lmms_engine.datasets.collator import VisionCollator
+@@ -15,6 +16,20 @@ from lmms_engine.mapping_func import register_dataset
+ from lmms_engine.utils.train_utils import TrainUtilities
+ 
+ 
++def check_video_reader(meta: dict, path: str) -> None:
++    """qwen_vl_utils falls back to torchvision when the forced reader (FORCE_QWENVL_VIDEO_READER = the configured
++    video reader) fails, which changes the frames silently. Raise (default) or warn (MOPD_VIDEO_READER_CHECK=warn)."""
++    want = os.environ.get("FORCE_QWENVL_VIDEO_READER")
++    got = (meta or {}).get("video_backend")
++    if not want or got is None or got == want:
++        return
++    msg = f"video {path} decoded with {got!r}, configured reader is {want!r} (qwen_vl_utils fell back)"
++    if os.environ.get("MOPD_VIDEO_READER_CHECK", "raise") == "warn":
++        logger.warning(msg)
++        return
++    raise RuntimeError(msg)
++
++
+ @register_dataset("qwen3_vl_iterable")
+ class Qwen3VLIterableDataset(VisionSFTIterableDataset):
+     def load_from_json(self, data, data_folder=None) -> Dict[str, torch.Tensor]:
+@@ -58,6 +73,9 @@ class Qwen3VLIterableDataset(VisionSFTIterableDataset):
+         inputs = self.processor.process(images=images, hf_messages=hf_messages, videos=videos, **kwargs)
+         return inputs
+ 
++    def _patch_size(self) -> int:
++        return int(self.processor.processor.video_processor.patch_size)
++
+     def load_videos(self, video_path: str, data_folder=None, fps: int = 1, video_kwargs=None):
+         assert (
+             self.config.video_backend == "qwen_vl_utils"
+@@ -88,7 +106,7 @@ class Qwen3VLIterableDataset(VisionSFTIterableDataset):
+         video_dict = {
+             "type": "video",
+             "video": f"file://{video_path}",
+-            "min_frames": 1,
++            "min_frames": self.config.video_min_frames,
+             "max_pixels": self.config.video_max_pixels,
+             "max_frames": self.config.video_max_frames,
+             "min_pixels": self.config.video_min_pixels,
+@@ -100,17 +118,19 @@ class Qwen3VLIterableDataset(VisionSFTIterableDataset):
+             n_frames = self.config.frame_num
+             video_dict["nframes"] = n_frames
+             video_inputs, sample_fps = fetch_video(
+-                video_dict, image_patch_size=16, return_video_sample_fps=True, return_video_metadata=True
++                video_dict, image_patch_size=self._patch_size(), return_video_sample_fps=True, return_video_metadata=True
+             )
+             frames, video_metadata = video_inputs
++            check_video_reader(video_metadata, video_path)
+             frames = frames.numpy()
+             return frames, video_metadata, sample_fps
+         elif self.config.video_sampling_strategy == "fps":
+             video_dict["fps"] = fps
+             video_inputs, sample_fps = fetch_video(
+-                video_dict, image_patch_size=16, return_video_sample_fps=True, return_video_metadata=True
++                video_dict, image_patch_size=self._patch_size(), return_video_sample_fps=True, return_video_metadata=True
+             )
+             frames, video_metadata = video_inputs
++            check_video_reader(video_metadata, video_path)
+             frames = frames.numpy()
+             return frames, video_metadata, sample_fps
+         else:
+diff --git a/src/lmms_engine/datasets/processor/qwen3_vl_processor.py b/src/lmms_engine/datasets/processor/qwen3_vl_processor.py
+index c55054a..6c7488c 100644
+--- a/src/lmms_engine/datasets/processor/qwen3_vl_processor.py
++++ b/src/lmms_engine/datasets/processor/qwen3_vl_processor.py
+@@ -12,20 +12,68 @@ from lmms_engine.utils import DataUtilities
+ from .base_qwen2_5_processor import BaseQwen2_5_DataProcessor
+ 
+ 
++ASSISTANT_OPEN = "<|im_start|>assistant\n"
++THINK_OPEN = "<think>\n"
++THINK_CLOSE = "\n</think>\n\n"
++EMPTY_THINK = "<think>\n\n</think>\n\n"
++IM_END = "<|im_end|>"
++
++
++def split_think(text: str):
++    """(reasoning, content) of an assistant text exactly as the native Qwen3.5 chat template splits it:
++    content is trimmed; with a </think> the reasoning is the part before it (trimmed), the content the part after it."""
++    content = text.strip()
++    if "</think>" in content:
++        reasoning = content.split("</think>")[0].rstrip("\n").split("<think>")[-1].lstrip("\n").strip()
++        content = content.split("</think>")[-1].lstrip("\n")
++        return reasoning, content
++    return "", content
++
++
+ @register_processor("qwen3_vl")
+ class Qwen3_VLDataProcessor(BaseQwen2_5_DataProcessor):
++    """Qwen3.5 / Qwen3-VL SFT processor (rewrite of the chat rendering and the labels).
++
++    processor_config.extra_kwargs (all optional):
++      image_min_pixels, image_max_pixels   image processor size (per image, also in multi-image rows)
++      system_prompt        None (default) = no system turn; a string adds one. A system message in the row wins.
++      enable_thinking      True (default): every assistant turn trains as the Qwen3.5 thinking generation
++                           "<|im_start|>assistant\n<think>\n" + reasoning + "\n</think>\n\n" + answer + "<|im_end|>";
++                           a turn without reasoning gets an EMPTY think block. False: the generation prefix is
++                           "<think>\n\n</think>\n\n" and only the answer is trained.
++      chat_template        "native" (default) = the template of the tokenizer / checkpoint (the Base processor has none, the
++                           tokenizer_config has it); or a jinja string. The template renders the user / system turns.
++    Labels: only the tokens a model generates after the generation prefix of EVERY assistant turn (reasoning, answer,
++    <|im_end|>); prompts, media, system, the generation prefix and the newline after <|im_end|> are masked (-100).
++    Video pixels are NOT set on the HF video processor: the per-frame cap is applied by qwen_vl_utils in the dataset
++    (the HF video size caps t*h*w of the whole clip).
++    """
++
++    def build(self):
++        self.processor = self._build_processor()
++        self.processor.chat_template = self._resolve_chat_template()
++        kw = self.config.extra_kwargs or {}
++        self.system_prompt = kw.get("system_prompt")
++        self.enable_thinking = bool(kw.get("enable_thinking", True))
++
++    def _resolve_chat_template(self):
++        tpl = (self.config.extra_kwargs or {}).get("chat_template", "native")
++        if tpl not in (None, "native"):
++            return tpl
++        tpl = getattr(self.processor, "chat_template", None) or getattr(self.processor.tokenizer, "chat_template", None)
++        if not tpl:
++            raise ValueError(f"no chat template in {self.config.processor_name}: processor and tokenizer have none")
++        return tpl
++
+     def _build_processor(self):
+         processor = Qwen3VLProcessor.from_pretrained(self.config.processor_name)
+ 
+-        # Set image processor parameters
++        # Image processor size = per-image bounds (applies to every image of a multi-image row).
+         image_max_pixels = self.config.extra_kwargs.get("image_max_pixels", None)
+         image_min_pixels = self.config.extra_kwargs.get("image_min_pixels", None)
+         self._set_vision_processor_size(processor.image_processor, image_min_pixels, image_max_pixels)
+-
+-        # Set video processor parameters
+-        video_max_pixels = self.config.extra_kwargs.get("video_max_pixels", None)
+-        video_min_pixels = self.config.extra_kwargs.get("video_min_pixels", None)
+-        self._set_vision_processor_size(processor.video_processor, video_min_pixels, video_max_pixels)
++        # Video: leave the HF video processor at the checkpoint default. Its `size` bounds t*h*w of the whole clip, so a
++        # per-frame cap set there shrinks every frame by ~1/frames. qwen_vl_utils (dataset) caps each frame.
+         return processor
+ 
+     def process(
+@@ -35,9 +83,6 @@ class Qwen3_VLDataProcessor(BaseQwen2_5_DataProcessor):
+         audios: Optional[List[np.ndarray]] = None,
+         sampling_rate: Optional[int] = None,
+         videos=None,
+-        system_message: str = "You are a helpful assistant",
+-        add_system_prompt=True,
+-        add_generation_prompt=False,  # Whether add a generation prompt at the end
+         **kwargs,
+     ):
+         assert audios is None, "Qwen3_VLDataProcessor does not support audio"
+@@ -85,9 +130,6 @@ class Qwen3_VLDataProcessor(BaseQwen2_5_DataProcessor):
+             num_video_tokens,
+             video_metadata,
+             video_grid_thw,
+-            system_message,
+-            add_system_prompt,
+-            add_generation_prompt,
+         )
+ 
+         if images is not None:
+@@ -99,6 +141,44 @@ class Qwen3_VLDataProcessor(BaseQwen2_5_DataProcessor):
+ 
+         return inputs
+ 
++    def _encode(self, text: str) -> List[int]:
++        return self.processor.tokenizer.encode(text, add_special_tokens=False)
++
++    def _expand_media(self, encode_id, num_image_tokens, num_video_tokens, video_metadata, video_grid_thw, state):
++        """Expand the image / video pad tokens of one rendered user turn. state = [images used, videos used]."""
++        if self.image_token_id in encode_id:
++            encode_id, used = self._expand_encode_id_image_tokens(encode_id, num_image_tokens, state[0])
++            state[0] += used
++        if self.video_token_id in encode_id:
++            # Qwen3 VL: one "<t seconds>" text + vision_start / pads / vision_end block per 2-frame temporal patch
++            metadata = video_metadata[state[1]]
++            if metadata.fps is None:
++                raise ValueError("video metadata has no fps; the reader did not report the source frame rate")
++            curr_timestamp = self.processor._calculate_timestamps(
++                metadata.frames_indices,
++                metadata.fps,
++                self.processor.video_processor.temporal_patch_size,
++            )
++            encode_id, used = self._expand_encode_id_video_tokens(
++                encode_id, num_video_tokens, state[1], curr_timestamp, video_grid_thw
++            )
++            state[1] += used
++        return encode_id
++
++    def _assistant_ids(self, message):
++        """(generation prefix ids, target ids) of one assistant turn; the model generates the target after the prefix."""
++        text = "".join(c.get("text", "") for c in message["content"] if c.get("type", "text") == "text")
++        reasoning, content = split_think(text)
++        if self.enable_thinking:
++            prefix = ASSISTANT_OPEN + THINK_OPEN
++            target = reasoning + THINK_CLOSE + content + IM_END
++        else:
++            prefix = ASSISTANT_OPEN + EMPTY_THINK
++            target = content + IM_END
++        # The prefix and the target are tokenized apart: the model continues from the prefix tokens, so the first target
++        # token must not merge with the prefix (an empty think block is "\n</think>" after "<think>\n", not "\n\n").
++        return self._encode(prefix), self._encode(target)
++
+     def get_qwen_template_labels(
+         self,
+         hf_messages,
+@@ -106,74 +186,36 @@ class Qwen3_VLDataProcessor(BaseQwen2_5_DataProcessor):
+         num_video_tokens: List[int],
+         video_metadata: List[dict],
+         video_grid_thw=None,
+-        system_message: str = "You are a helpful assistant",
+-        add_system_prompt: bool = True,
+-        add_generation_prompt: bool = False,
+     ):
+-        unmask_tokens_idx = [self.processor.tokenizer.convert_tokens_to_ids(t) for t in self.special_tokens]
+         input_id, target = [], []
+-        image_start_from = 0
+-        video_start_from = 0
+-        if add_system_prompt and hf_messages[0]["role"] != "system":
+-            input_id += DataUtilities.apply_chat_template(
+-                self.processor, [{"role": "system", "content": [{"type": "text", "text": system_message}]}]
+-            )
+-            target += [-100] * len(input_id)
+-        for message in hf_messages:
++        state = [0, 0]
++        messages = list(hf_messages)
++        if self.system_prompt is not None and messages[0]["role"] != "system":
++            messages.insert(0, {"role": "system", "content": [{"type": "text", "text": self.system_prompt}]})
++        newline = self._encode("\n")
++        for message in messages:
+             role = message["role"]
+-            encode_id = DataUtilities.apply_chat_template(self.processor, [message])
+-            # Should be 3 if instead of if else, so that can expand for each case
+-            if self.image_token_id in encode_id:
+-                encode_id, used_images = self._expand_encode_id_image_tokens(
+-                    encode_id, num_image_tokens, image_start_from
+-                )
+-                image_start_from += used_images
+-            if self.video_token_id in encode_id:
+-                # Qwen3 VL new logic, build timestamp for different video frames
+-                metadata = video_metadata[video_start_from]
+-                if metadata.fps is None:
+-                    metadata.fps = 24 if metadata.fps is None else metadata.fps
+-                curr_timestamp = self.processor._calculate_timestamps(
+-                    metadata.frames_indices,
+-                    metadata.fps,
+-                    self.processor.video_processor.temporal_patch_size,
+-                )
+-                encode_id, used_video = self._expand_encode_id_video_tokens(
+-                    encode_id,
+-                    num_video_tokens,
+-                    video_start_from,
+-                    curr_timestamp,
+-                    video_grid_thw,
+-                )
+-                video_start_from += used_video
+-
+-            input_id += encode_id
+-            if role in ["user", "system"]:
++            if role == "assistant":
++                prefix, tgt = self._assistant_ids(message)
++                input_id += prefix + tgt + newline
++                target += [-100] * len(prefix) + tgt + [-100] * len(newline)
++            elif role == "system":
++                text = "".join(c.get("text", "") for c in message["content"] if c.get("type", "text") == "text")
++                encode_id = self._encode(f"<|im_start|>system\n{text.strip()}{IM_END}\n")
++                input_id += encode_id
+                 target += [-100] * len(encode_id)
+             else:
+-                # Adopted from llava-ov that mask out the assistant
+-                encode_id[:3] = [-100] * 3
+-                target += encode_id
+-
+-        if add_generation_prompt:
+-            generation_tokens = self.processor.tokenizer.encode("<|im_start|>assistant\n")
+-            input_id += generation_tokens
+-            target += [-100] * len(generation_tokens)
++                # the native template renders one user turn on its own (no state across turns)
++                encode_id = DataUtilities.apply_chat_template(self.processor, [message])
++                encode_id = self._expand_media(
++                    encode_id, num_image_tokens, num_video_tokens, video_metadata, video_grid_thw, state
++                )
++                input_id += encode_id
++                target += [-100] * len(encode_id)
+         assert len(input_id) == len(target), f"{len(input_id)} != {len(target)}"
+-        for idx, encode_id in enumerate(input_id):
+-            if encode_id in unmask_tokens_idx:
+-                target[idx] = encode_id
+-            if encode_id == self.image_token_id:
+-                target[idx] = -100
+-            if encode_id == self.video_token_id:
+-                target[idx] = -100
+-
+-        input_id = torch.tensor(input_id, dtype=torch.long)
+-        target = torch.tensor(target, dtype=torch.long)
+-
+         return dict(
+-            input_ids=input_id,
+-            labels=target,
++            input_ids=torch.tensor(input_id, dtype=torch.long),
++            labels=torch.tensor(target, dtype=torch.long),
+         )
+ 
+     def _expand_encode_id_video_tokens(
+diff --git a/src/lmms_engine/models/qwen3_5/qwen3_5_liger.py b/src/lmms_engine/models/qwen3_5/qwen3_5_liger.py
+index e0e6ed5..cd0a147 100644
+--- a/src/lmms_engine/models/qwen3_5/qwen3_5_liger.py
++++ b/src/lmms_engine/models/qwen3_5/qwen3_5_liger.py
+@@ -30,6 +30,10 @@ def qwen3_5_lce_forward(
+     position_ids: Optional[torch.LongTensor] = None,
+     past_key_values: Optional[List[torch.FloatTensor]] = None,
+     inputs_embeds: Optional[torch.FloatTensor] = None,
++    pixel_values: Optional[torch.Tensor] = None,
++    pixel_values_videos: Optional[torch.FloatTensor] = None,
++    image_grid_thw: Optional[torch.LongTensor] = None,
++    video_grid_thw: Optional[torch.LongTensor] = None,
+     labels: Optional[torch.LongTensor] = None,
+     use_cache: Optional[bool] = None,
+     output_attentions: Optional[bool] = None,
+@@ -59,6 +63,10 @@ def qwen3_5_lce_forward(
+         position_ids=position_ids,
+         past_key_values=past_key_values,
+         inputs_embeds=inputs_embeds,
++        pixel_values=pixel_values,  # the VL stack needs the media; without them the vision tower never runs
++        pixel_values_videos=pixel_values_videos,
++        image_grid_thw=image_grid_thw,
++        video_grid_thw=video_grid_thw,
+         use_cache=use_cache,
+         output_attentions=output_attentions,
+         output_hidden_states=output_hidden_states,
+diff --git a/src/lmms_engine/models/qwen3_5/qwen3_5_ops.py b/src/lmms_engine/models/qwen3_5/qwen3_5_ops.py
+index 5cd6675..c7ab179 100644
+--- a/src/lmms_engine/models/qwen3_5/qwen3_5_ops.py
++++ b/src/lmms_engine/models/qwen3_5/qwen3_5_ops.py
+@@ -529,6 +529,14 @@ def attn_forward(
+     return attn_output, None
+ 
+ 
++def _dummy_media(self, device: torch.device) -> Tuple[torch.Tensor, torch.LongTensor]:
++    """One 2x2-patch image (one merged token) to keep the vision tower in every rank's step."""
++    cfg = self.config.vision_config
++    grid = torch.tensor([[1, 2, 2]], dtype=torch.long, device=device)
++    dim = cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size**2
++    return torch.zeros(4, dim, dtype=self.visual.dtype, device=device), grid
++
++
+ def model_forward(
+     self: Union[Qwen3_5Model, Qwen3_5MoeModel],
+     input_ids: torch.LongTensor = None,
+@@ -610,23 +618,35 @@ def model_forward(
+         inputs_embeds = self.get_input_embeddings()(input_ids)
+ 
+     # ---- visual feature injection (still on packed inputs_embeds) ----
+-    if pixel_values is not None:
+-        image_outputs: BaseModelOutputWithPooling = self.get_image_features(
+-            pixel_values, image_grid_thw, return_dict=True
+-        )
+-        image_embeds = image_outputs.pooler_output
+-        image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+-        image_mask, _ = self.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds)
+-        inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+-
+-    if pixel_values_videos is not None:
+-        video_outputs: BaseModelOutputWithPooling = self.get_video_features(
+-            pixel_values_videos, video_grid_thw, return_dict=True
+-        )
+-        video_embeds = video_outputs.pooler_output
+-        video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+-        _, video_mask = self.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds)
+-        inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
++    # FSDP: every rank must run the vision tower the same number of times per micro-batch, else the
++    # per-block all-gathers of the ranks pair up wrong and NCCL hangs (a text-only or an image+video micro-batch
++    # on one rank). In training: ONE vision call for images + videos together (same tower, same patch layout),
++    # and a 4-patch dummy image with zero weight when the micro-batch has no media.
++    media = [(p, g) for p, g in ((pixel_values, image_grid_thw), (pixel_values_videos, video_grid_thw)) if p is not None]
++    if media or self.training:
++        if media:
++            pixels = torch.cat([p.type(self.visual.dtype) for p, _ in media], dim=0)
++            grid = torch.cat([g for _, g in media], dim=0)
++        else:
++            pixels, grid = _dummy_media(self, inputs_embeds.device)
++        vision_outputs: BaseModelOutputWithPooling = self.get_image_features(pixels, grid, return_dict=True)
++        vision_embeds = torch.cat(vision_outputs.pooler_output, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
++        if not media:
++            inputs_embeds = inputs_embeds + 0.0 * vision_embeds.sum()
++        n_image = 0
++        if pixel_values is not None:
++            n_image = int(image_grid_thw.prod(-1).sum()) // self.visual.spatial_merge_size**2
++            image_embeds = vision_embeds[:n_image]
++            image_mask, _ = self.get_placeholder_mask(
++                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
++            )
++            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
++        if pixel_values_videos is not None:
++            video_embeds = vision_embeds[n_image:]
++            _, video_mask = self.get_placeholder_mask(
++                input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
++            )
++            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+ 
+     # `cu_seq_lens` / `indices` may already be in **kwargs from the collator
+     # (we compute fresh ones from attention_mask); drop them to avoid duplicate kwargs.
+diff --git a/src/lmms_engine/models/utils.py b/src/lmms_engine/models/utils.py
+index 6af2fcb..ec91cbe 100644
+--- a/src/lmms_engine/models/utils.py
++++ b/src/lmms_engine/models/utils.py
+@@ -74,6 +74,7 @@ class FlopsCounter:
+             "qwen3_moe": self._estimate_qwen2_moe_flops,
+             "qwen3_omni_moe": self._estimate_qwen2_moe_flops,
+             "qwen3_omni_moe_thinker": self._estimate_qwen2_moe_flops,
++            "qwen3_5": self._estimate_qwen3_5_flops,
+             "qwen3_vl": self._estimate_qwen2_flops,
+             "qwen3_vl_moe": self._estimate_qwen2_moe_flops,
+             "aero_realtime": self._estimate_qwen2_flops,
+@@ -154,6 +155,73 @@ class FlopsCounter:
+         flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
+         return flops_achieved, flops_all_token
+ 
++    def _estimate_qwen3_5_flops(self, tokens_sum, batch_seqlens, delta_time):
++        # Qwen3.5 is a hybrid model: most layers are Gated DeltaNet (linear attention),
++        # every full_attention_interval-th layer is gated full attention. Same accounting as
++        # verl's _estimate_qwen3_5_flops, with this file's full-attention factor (12).
++        config = self.config
++        hidden_size = config.hidden_size
++        vocab_size = config.vocab_size
++        num_hidden_layers = config.num_hidden_layers
++        num_key_value_heads = config.num_key_value_heads
++        num_attention_heads = config.num_attention_heads
++        intermediate_size = config.intermediate_size
++
++        head_dim = getattr(
++            config,
++            "head_dim",
++            config.hidden_size // config.num_attention_heads,
++        )
++        q_size = num_attention_heads * head_dim
++        k_size = num_key_value_heads * head_dim
++        v_size = num_key_value_heads * head_dim
++
++        layer_types = getattr(config, "layer_types", None)
++        if layer_types:
++            num_full_attn_layers = sum(layer_type == "full_attention" for layer_type in layer_types)
++        else:
++            interval = getattr(config, "full_attention_interval", 4)
++            num_full_attn_layers = num_hidden_layers // interval
++        num_linear_attn_layers = num_hidden_layers - num_full_attn_layers
++
++        # full attention: q_proj also emits the output gate (2x query size), plus k, v, o
++        full_attn_linear_N = hidden_size * (2 * q_size + k_size + v_size + q_size)
++        # Gated DeltaNet: in_proj_qkvz (2k + 2v), in_proj_ba (2 * value heads), out_proj (v), short conv over q, k, v
++        linear_k_size = config.linear_num_key_heads * config.linear_key_head_dim
++        linear_v_size = config.linear_num_value_heads * config.linear_value_head_dim
++        linear_attn_linear_N = hidden_size * (2 * linear_k_size + 3 * linear_v_size + 2 * config.linear_num_value_heads)
++        conv_N = config.linear_conv_kernel_dim * (2 * linear_k_size + linear_v_size)
++
++        mlp_N = hidden_size * intermediate_size * 3
++        emd_and_lm_head_N = vocab_size * hidden_size * 2
++        dense_N = (
++            mlp_N * num_hidden_layers
++            + full_attn_linear_N * num_full_attn_layers
++            + (linear_attn_linear_N + conv_N) * num_linear_attn_layers
++            + emd_and_lm_head_N
++        )
++        dense_N_flops = 6 * dense_N * tokens_sum
++
++        # quadratic attention only in the full-attention layers
++        seqlen_square_sum = 0
++        for seqlen in batch_seqlens:
++            seqlen_square_sum += seqlen * seqlen
++        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_full_attn_layers
++
++        # DeltaNet recurrence is linear in the sequence length
++        gdn_recurrence_flops = (
++            15
++            * config.linear_key_head_dim
++            * config.linear_value_head_dim
++            * config.linear_num_value_heads
++            * tokens_sum
++            * num_linear_attn_layers
++        )
++
++        flops_all_token = dense_N_flops + attn_qkv_flops + gdn_recurrence_flops
++        flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
++        return flops_achieved, flops_all_token
++
+     def _estimate_deepseek_v3_flops(self, tokens_sum, batch_seqlens, delta_time):
+         hidden_size = self.config.hidden_size
+         vocab_size = self.config.vocab_size
+diff --git a/src/lmms_engine/train/config.py b/src/lmms_engine/train/config.py
+index 190bae2..c7bb4a8 100644
+--- a/src/lmms_engine/train/config.py
++++ b/src/lmms_engine/train/config.py
+@@ -16,6 +16,8 @@ class TrainingArguments(transformers.TrainingArguments):
+     reduce_dtype: Optional[str] = "bfloat16"
+     output_dtype: Optional[str] = "bfloat16"
+     print_batch_input_steps: Optional[int] = -1
++    # steps that always save a checkpoint which save_total_limit rotation never removes (e.g. epoch ends)
++    save_keep_steps: Optional[List[int]] = None
+     enable_profiler: Optional[bool] = False
+     profiler_config: Optional[Dict[str, Any]] = None
+     # CUDA memory snapshot profiler (separate from StepProfiler).
+diff --git a/src/lmms_engine/train/fsdp2/fsdp2_trainer.py b/src/lmms_engine/train/fsdp2/fsdp2_trainer.py
+index b805fc4..a07a2ac 100644
+--- a/src/lmms_engine/train/fsdp2/fsdp2_trainer.py
++++ b/src/lmms_engine/train/fsdp2/fsdp2_trainer.py
+@@ -43,6 +43,7 @@ from lmms_engine.utils.profiler import (
+ from lmms_engine.utils.tracking import Tracking
+ 
+ DatasetType = Union[Dataset, IterableDataset]
++KEEP_MARKER = "KEEP"  # checkpoint dirs with this file are never rotated (save_keep_steps)
+ 
+ 
+ @TRAINER_REGISTER.register("fsdp2_trainer")
+@@ -500,7 +501,11 @@ class FSDP2SFTTrainer:
+         if total_limit is None:
+             return
+         # get all checkpoints in output_path
+-        checkpoints = [f for f in os.listdir(output_path) if f.startswith("checkpoint")]
++        checkpoints = [
++            f
++            for f in os.listdir(output_path)
++            if f.startswith("checkpoint") and not os.path.exists(os.path.join(output_path, f, KEEP_MARKER))
++        ]
+         checkpoints.sort(key=lambda x: int(x.split("-")[1]))
+         if len(checkpoints) > total_limit:
+             for checkpoint in checkpoints[:-total_limit]:
+@@ -566,12 +571,16 @@ class FSDP2SFTTrainer:
+         if rank == 0:
+             self.processing_class.save_pretrained(output_path)
+             self.model.config.save_pretrained(output_path)
++            if step in (self.args.save_keep_steps or []):
++                open(os.path.join(output_path, KEEP_MARKER), "w").close()
+             self.remove_old_checkpoints(self.args.output_dir, total_limit=self.args.save_total_limit)
+ 
+         dist.barrier()
+ 
+     @property
+     def should_save(self):
++        if self.global_step in (self.args.save_keep_steps or []):
++            return True
+         return self.global_step % self.args.save_steps == 0 and self.global_step > 0
+ 
+     def load_checkpoints(self, output_path: str, step: int):
+diff --git a/src/lmms_engine/utils/train_utils.py b/src/lmms_engine/utils/train_utils.py
+index 07877d0..76f60db 100644
+--- a/src/lmms_engine/utils/train_utils.py
++++ b/src/lmms_engine/utils/train_utils.py
+@@ -2,7 +2,6 @@ import logging
+ import math
+ from typing import Iterable, List, Literal, Optional, Union
+ 
+-import deepspeed
+ import torch
+ import torch.distributed as dist
+ from loguru import logger
+@@ -416,6 +415,8 @@ class TrainUtilities:
+                 # because zero3 puts placeholders in model params, this context
+                 # manager gathers (unpartitions) the params of the current layer, then loads from
+                 # the state dict and then re-partitions them again
++                import deepspeed  # lazy: only the ZeRO-3 path needs it
++
+                 with deepspeed.zero.GatheredParameters(list(module.parameters(recurse=False)), modifier_rank=0):
+                     if torch.distributed.get_rank() == 0:
+                         module._load_from_state_dict(*args)
+diff --git a/test/utils/test_flops_counter.py b/test/utils/test_flops_counter.py
+new file mode 100644
+index 0000000..a1d4f5f
+--- /dev/null
++++ b/test/utils/test_flops_counter.py
+@@ -0,0 +1,53 @@
++import unittest
++
++from transformers import PretrainedConfig
++
++from lmms_engine.models.utils import FlopsCounter
++
++
++def _qwen3_5_config(layer_types):
++    text_config = PretrainedConfig(
++        hidden_size=64,
++        vocab_size=1000,
++        num_hidden_layers=len(layer_types),
++        num_attention_heads=4,
++        num_key_value_heads=2,
++        head_dim=16,
++        intermediate_size=128,
++        layer_types=layer_types,
++        linear_num_key_heads=4,
++        linear_num_value_heads=8,
++        linear_key_head_dim=16,
++        linear_value_head_dim=16,
++        linear_conv_kernel_dim=4,
++    )
++    config = PretrainedConfig(text_config=text_config.to_dict())
++    config.model_type = "qwen3_5"
++    config.text_config = text_config
++    return config
++
++
++class TestQwen3_5FlopsCounter(unittest.TestCase):
++    def test_qwen3_5_is_counted(self):
++        counter = FlopsCounter(_qwen3_5_config(["linear_attention"] * 3 + ["full_attention"]))
++        self.assertEqual(counter.estimate_func[counter.config.model_type], counter._estimate_qwen3_5_flops)
++        flops, raw_flops = counter._estimate_qwen3_5_flops(300, [100, 200], 1.0)
++        self.assertGreater(flops, 0)
++        self.assertGreater(raw_flops, 0)
++
++    def test_quadratic_term_only_in_full_attention_layers(self):
++        # With no full-attention layer the cost is linear in the sequence length.
++        counter = FlopsCounter(_qwen3_5_config(["linear_attention"] * 4))
++        _, one_long = counter._estimate_qwen3_5_flops(200, [200], 1.0)
++        _, two_short = counter._estimate_qwen3_5_flops(200, [100, 100], 1.0)
++        self.assertEqual(one_long, two_short)
++
++        counter = FlopsCounter(_qwen3_5_config(["linear_attention"] * 3 + ["full_attention"]))
++        _, one_long = counter._estimate_qwen3_5_flops(200, [200], 1.0)
++        _, two_short = counter._estimate_qwen3_5_flops(200, [100, 100], 1.0)
++        # 12 * (200^2 - 2 * 100^2) * head_dim * heads * full layers
++        self.assertEqual(one_long - two_short, 12 * 20000 * 16 * 4 * 1)
++
++
++if __name__ == "__main__":
++    unittest.main()

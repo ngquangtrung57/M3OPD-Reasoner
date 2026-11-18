@@ -1,0 +1,79 @@
+# SFT warm-up of the video teacher: Qwen3.5-9B on the video part of M3OPD-SFT-1.35M (Qwen3.8-Flash-Next traces).
+# Layout: 4 nodes x 8 GPUs. Tokens per optimizer step: 32 GPUs x 8192 (packing) x 4 (grad. accum.) = 1,048,576.
+# Rendered by `python -m m3opd.sft_config`: ${VAR} is taken from the environment, and `datasets_glob` becomes the dataset list.
+trainer_type: fsdp2_trainer
+dataset_config:
+  dataset_type: qwen3_vl_iterable
+  dataset_format: yaml
+  datasets_glob: ${DATA_DIR}/sft/video/part_*.jsonl
+  data_seed: 42
+  shuffle: true
+  packing: true
+  packing_length: 8192
+  packing_strategy: balanced
+  filter_overlong: true
+  filter_overlong_workers: 8
+  object_storage: none
+  processor_config:
+    processor_name: ${BASE_MODEL}
+    processor_type: qwen3_vl
+    extra_kwargs:
+      chat_template: native
+      enable_thinking: true
+      system_prompt: null
+      image_min_pixels: 65536
+      image_max_pixels: 1605632
+  video_backend: qwen_vl_utils
+  video_sampling_strategy: fps
+  fps: 1.0
+  frame_num: 64
+  video_min_frames: 4
+  video_max_frames: 150
+  video_min_pixels: 4096
+  video_max_pixels: 65536
+model_config:
+  load_from_pretrained_path: ${BASE_MODEL}
+  model_general_type: image_text_to_text
+  attn_implementation: flash_attention_2
+  monkey_patch_kwargs:
+    patch_type: [liger]
+trainer_args:
+  output_dir: ${OUTPUT_DIR}
+  run_name: sft_video
+  report_to: [wandb]
+  do_train: true
+  do_eval: false
+  max_steps: 1021
+  num_train_epochs: 1
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 4
+  learning_rate: 1.0e-05
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.03
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  optim: adamw_torch_fused
+  bf16: true
+  tf32: true
+  output_dtype: bfloat16
+  reduce_dtype: bfloat16
+  seed: 42
+  gradient_checkpointing: true
+  use_liger_kernel: true
+  use_rmpad: true
+  sp_ulysses_degree: 1
+  fsdp2: true
+  fsdp_config:
+    transformer_layer_cls_to_wrap: [Qwen3_5DecoderLayer]
+    min_num_params: 0
+    reshard_after_forward: false
+  dataloader_num_workers: 4
+  dataloader_prefetch_factor: 2
+  dataloader_drop_last: true
+  remove_unused_columns: false
+  ddp_timeout: 3600
+  logging_steps: 1
+  save_strategy: steps
+  save_steps: 50
+  save_total_limit: 2
+  save_keep_steps: []

@@ -1,0 +1,3673 @@
+diff --git a/tests/experimental/agent_loop/test_teacher_retry_on_cpu.py b/tests/experimental/agent_loop/test_teacher_retry_on_cpu.py
+new file mode 100644
+index 00000000..ac2cc585
+--- /dev/null
++++ b/tests/experimental/agent_loop/test_teacher_retry_on_cpu.py
+@@ -0,0 +1,53 @@
++# Copyright 2026 The M3OPD-Reasoner Authors
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""teacher calls retry transient errors and fail at once on deterministic ones."""
++
++import asyncio
++
++import pytest
++
++from verl.experimental.agent_loop.agent_loop import _with_teacher_retry
++
++
++def _flaky(errors, result="ok"):
++    calls = {"n": 0}
++
++    async def call():
++        calls["n"] += 1
++        if errors:
++            raise errors.pop(0)
++        return result
++
++    return call, calls
++
++
++def test_transient_errors_are_retried():
++    call, calls = _flaky([ConnectionResetError("reset"), RuntimeError("replica restart")])
++    assert asyncio.run(_with_teacher_retry(call, attempts=4, base_delay_s=0)) == "ok"
++    assert calls["n"] == 3
++
++
++def test_last_transient_error_propagates():
++    call, calls = _flaky([ConnectionResetError("reset")] * 4)
++    with pytest.raises(ConnectionResetError):
++        asyncio.run(_with_teacher_retry(call, attempts=4, base_delay_s=0))
++    assert calls["n"] == 4
++
++
++@pytest.mark.parametrize("err", [AssertionError("prompt_logprobs length 10 != 11"), ValueError("unknown routing key")])
++def test_deterministic_errors_fail_at_once(err):
++    call, calls = _flaky([err])
++    with pytest.raises(type(err)):
++        asyncio.run(_with_teacher_retry(call, attempts=4, base_delay_s=0))
++    assert calls["n"] == 1
+diff --git a/tests/models/test_lm_head_grad_avg_on_cpu.py b/tests/models/test_lm_head_grad_avg_on_cpu.py
+new file mode 100644
+index 00000000..5a19cfc6
+--- /dev/null
++++ b/tests/models/test_lm_head_grad_avg_on_cpu.py
+@@ -0,0 +1,122 @@
++# Copyright 2026 The M3OPD-Reasoner Authors
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""A separately-wrapped FSDP2 lm_head must get a dp-averaged gradient on the fused-kernel path.
++
++The fused path reads ``lm_head.weight`` as a DTensor and calls ``full_tensor``. The lm_head is its own
++FSDP unit, so its hooks never run and ``full_tensor``'s backward keeps each rank's LOCAL rows unless
++``grad_placements=[Partial("avg")]`` is passed (2-process gloo test).
++"""
++
++import inspect
++import os
++import tempfile
++
++import pytest
++import torch
++import torch.distributed as dist
++import torch.multiprocessing as mp
++import torch.nn as nn
++from torch.distributed.device_mesh import init_device_mesh
++from torch.distributed.fsdp import fully_shard
++from torch.distributed.tensor import DTensor
++from torch.distributed.tensor.placement_types import Partial
++
++
++class _Tiny(nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.body = nn.Linear(8, 8, bias=False)
++        self.lm_head = nn.Linear(8, 16, bias=False)
++
++    def forward(self, x, avg_grad):
++        h = self.body(x)
++        w = self.lm_head.weight
++        assert isinstance(w, DTensor)
++        w = w.full_tensor(grad_placements=[Partial("avg")] * w.device_mesh.ndim) if avg_grad else w.full_tensor()
++        return (h @ w.T).logsumexp(-1).sum()
++
++
++def _worker(rank, world_size, init_file, avg_grad, out, mesh_shape):
++    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
++    torch.manual_seed(0)
++    m, ref = _Tiny(), _Tiny()
++    ref.load_state_dict(m.state_dict())
++    names = ("replicate", "shard") if len(mesh_shape) == 2 else None  # 2 dims = HSDP
++    mesh = init_device_mesh("cpu", mesh_shape, mesh_dim_names=names)
++    fully_shard(m.body, mesh=mesh)
++    fully_shard(m.lm_head, mesh=mesh)  # separate unit, like an untied lm_head in verl
++    fully_shard(m, mesh=mesh)
++    torch.manual_seed(100 + rank)
++    x = torch.randn(4, 8)
++    m(x, avg_grad).backward()
++    h = ref.body(x)
++    (h @ ref.lm_head.weight.T).logsumexp(-1).sum().backward()
++    res = {}
++    for name, p, rp in (("lm_head", m.lm_head.weight, ref.lm_head.weight), ("body", m.body.weight, ref.body.weight)):
++        g_ref = rp.grad.clone()
++        dist.all_reduce(g_ref)
++        g_ref /= world_size
++        res[name] = (p.grad.full_tensor() - g_ref).abs().max().item()
++    if rank == 0:
++        out.put(res)
++    dist.destroy_process_group()
++
++
++def _run(avg_grad, mesh_shape=(2,)):
++    world_size = 1
++    for n in mesh_shape:
++        world_size *= n
++    ctx = mp.get_context("spawn")
++    out = ctx.Queue()
++    with tempfile.TemporaryDirectory() as d:
++        init_file = os.path.join(d, "init")
++        procs = [
++            ctx.Process(target=_worker, args=(r, world_size, init_file, avg_grad, out, mesh_shape))
++            for r in range(world_size)
++        ]
++        for p in procs:
++            p.start()
++        res = out.get(timeout=120)
++        for p in procs:
++            p.join(timeout=60)
++            assert p.exitcode == 0
++    return res
++
++
++def test_lm_head_grad_is_dp_mean_with_partial_avg():
++    res = _run(True)
++    assert res["body"] < 1e-5  # control: FSDP hooks average the body
++    assert res["lm_head"] < 1e-5
++
++
++def test_lm_head_grad_is_global_mean_under_hsdp():
++    res = _run(True, mesh_shape=(2, 2))
++    assert res["body"] < 1e-5
++    assert res["lm_head"] < 1e-5
++
++
++def test_lm_head_grad_is_local_without_partial_avg():
++    # Documents the bug the fix removes: plain full_tensor() keeps the local rows.
++    res = _run(False)
++    assert res["body"] < 1e-5
++    assert res["lm_head"] > 1e-3
++
++
++@pytest.mark.parametrize("name", ["qwen3_5", "qwen3_vl"])
++def test_model_files_use_partial_avg(name):
++    import importlib
++
++    src = inspect.getsource(importlib.import_module(f"verl.models.transformers.{name}"))
++    assert src.count("full_tensor(") == src.count("full_tensor(grad_placements=avg)") >= 1
++    assert '[Partial("avg")] * vocab_weights.device_mesh.ndim' in src
+diff --git a/tests/trainer/ppo/test_per_source_train_metrics_on_cpu.py b/tests/trainer/ppo/test_per_source_train_metrics_on_cpu.py
+new file mode 100644
+index 00000000..81d9e514
+--- /dev/null
++++ b/tests/trainer/ppo/test_per_source_train_metrics_on_cpu.py
+@@ -0,0 +1,149 @@
++# Copyright 2026 The M3OPD-Reasoner Authors
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""CPU tests for compute_per_source_train_metrics (training_ds/<ds>/* metrics).
++
++Fake batch, B=5 rows, response width L=4, two sources. Every number below is checked by hand:
++
++    row  source  resp_len  score  adv   acc
++     0   imgr    4         1.0     0.5  1.0
++     1   imgr    2         0.0    -0.5  0.0
++     2   vid     4         1.0     1.0  1.0
++     3   vid     3         0.5     0.0  (no acc)
++     4   vid     0 (abort) 0.0     0.0  0.0
++
++Advantages outside the response mask are 9.0 so a mask bug shows up.
++"""
++
++import pytest
++import torch
++from tensordict import TensorDict
++
++from verl import DataProto
++from verl.trainer.ppo.metric_utils import compute_per_source_train_metrics
++
++LENGTHS = [4, 2, 4, 3, 0]
++SCORES = [1.0, 0.0, 1.0, 0.5, 0.0]
++ADVS = [0.5, -0.5, 1.0, 0.0, 0.0]
++SOURCES = ["imgr", "imgr", "vid", "vid", "vid"]
++EXTRA_FIELDS = [
++    {"reward_extra_info": {"acc": 1.0}},
++    {"reward_extra_info": {"acc": 0.0}},
++    {"reward_extra_info": {"acc": 1.0}},
++    {"reward_extra_info": {}},
++    {"reward_extra_info": {"acc": 0.0}},
++]
++L = 4
++
++
++def _make_batch() -> DataProto:
++    n = len(LENGTHS)
++    mask = torch.zeros(n, L)
++    scores = torch.zeros(n, L)
++    advantages = torch.full((n, L), 9.0)
++    for i, length in enumerate(LENGTHS):
++        mask[i, :length] = 1
++        if length > 0:
++            scores[i, length - 1] = SCORES[i]  # the sequence score sits on the last response token
++        advantages[i, :length] = ADVS[i]
++    data = TensorDict(
++        {
++            "responses": torch.zeros(n, L, dtype=torch.int64),
++            "response_mask": mask,
++            "token_level_scores": scores,
++            "advantages": advantages,
++            "prompt_length": torch.full((n,), 5.0),
++            "response_length": torch.tensor(LENGTHS, dtype=torch.float32),
++        },
++        batch_size=[n],
++    )
++    return DataProto(batch=data)
++
++
++def test_two_sources_values_by_hand():
++    out = compute_per_source_train_metrics(_make_batch(), SOURCES, EXTRA_FIELDS, max_response_length=L)
++
++    # imgr: rows 0,1. 6 response tokens (4+2), total batch 13 (4+2+4+3+0).
++    assert out["training_ds/imgr/n_samples"] == 2
++    assert out["training_ds/imgr/sample_share"] == pytest.approx(2 / 5)
++    assert out["training_ds/imgr/token_share"] == pytest.approx(6 / 13)
++    assert out["training_ds/imgr/score/mean"] == pytest.approx(0.5)
++    assert out["training_ds/imgr/acc/mean"] == pytest.approx(0.5)
++    assert out["training_ds/imgr/response_length/mean"] == pytest.approx(3.0)
++    assert out["training_ds/imgr/response_length/clip_ratio"] == pytest.approx(0.5)  # only row 0 hits 4
++    assert out["training_ds/imgr/advantages/abs_mean"] == pytest.approx((0.5 * 4 + 0.5 * 2) / 6)
++    assert out["training_ds/imgr/advantages/zero_frac"] == pytest.approx(0.0)
++
++    # vid: rows 2,3,4. 7 response tokens (4+3+0). The aborted row 4 leaves the score mean but not the counts.
++    assert out["training_ds/vid/n_samples"] == 3
++    assert out["training_ds/vid/sample_share"] == pytest.approx(3 / 5)
++    assert out["training_ds/vid/token_share"] == pytest.approx(7 / 13)
++    assert out["training_ds/vid/score/mean"] == pytest.approx((1.0 + 0.5) / 2)
++    assert out["training_ds/vid/acc/mean"] == pytest.approx((1.0 + 0.0) / 2)  # row 3 has no acc
++    assert out["training_ds/vid/response_length/mean"] == pytest.approx(7 / 3)
++    assert out["training_ds/vid/response_length/clip_ratio"] == pytest.approx(1 / 3)
++    assert out["training_ds/vid/advantages/abs_mean"] == pytest.approx(4 / 7)  # only row 2 has |adv| > 0
++    assert out["training_ds/vid/advantages/zero_frac"] == pytest.approx(3 / 7)  # row 3's 3 tokens
++
++    assert out["training_ds/imgr/token_share"] + out["training_ds/vid/token_share"] == pytest.approx(1.0)
++    assert out["training_ds/imgr/sample_share"] + out["training_ds/vid/sample_share"] == pytest.approx(1.0)
++
++
++def test_max_response_length_override_and_default():
++    # Cap 3: only row 3 (length 3) is at the cap; the padded width 4 is the default cap.
++    capped = compute_per_source_train_metrics(_make_batch(), SOURCES, max_response_length=3)
++    assert capped["training_ds/imgr/response_length/clip_ratio"] == pytest.approx(0.0)
++    assert capped["training_ds/vid/response_length/clip_ratio"] == pytest.approx(1 / 3)
++    default = compute_per_source_train_metrics(_make_batch(), SOURCES)
++    assert default["training_ds/imgr/response_length/clip_ratio"] == pytest.approx(0.5)
++
++
++def test_acc_key_absent_without_acc():
++    out = compute_per_source_train_metrics(_make_batch(), SOURCES)  # no extra_fields at all
++    assert not [k for k in out if k.endswith("/acc/mean")]
++    no_acc = [{"reward_extra_info": {}}, None, {}, {"reward_extra_info": None}, {"other": 1}]
++    out = compute_per_source_train_metrics(_make_batch(), SOURCES, no_acc)
++    assert not [k for k in out if k.endswith("/acc/mean")]
++    assert out["training_ds/imgr/n_samples"] == 2
++
++
++def test_single_source_batch():
++    out = compute_per_source_train_metrics(_make_batch(), ["imgr"] * 5, EXTRA_FIELDS, max_response_length=L)
++    assert {k.split("/")[1] for k in out} == {"imgr"}
++    assert out["training_ds/imgr/n_samples"] == 5
++    assert out["training_ds/imgr/sample_share"] == pytest.approx(1.0)
++    assert out["training_ds/imgr/token_share"] == pytest.approx(1.0)
++    assert out["training_ds/imgr/response_length/mean"] == pytest.approx(13 / 5)
++    assert out["training_ds/imgr/score/mean"] == pytest.approx((1.0 + 0.0 + 1.0 + 0.5) / 4)  # non-aborted rows
++
++
++def test_none_source_entry_is_unknown():
++    out = compute_per_source_train_metrics(_make_batch(), ["imgr", None, "vid", "vid", "vid"])
++    assert out["training_ds/unknown/n_samples"] == 1
++    assert out["training_ds/imgr/n_samples"] == 1
++
++
++@pytest.mark.parametrize("data_sources", [None, [], ["imgr", "vid"]])
++def test_missing_or_mismatched_data_source_returns_empty(data_sources):
++    # No data_source, empty, or length != batch size: no metrics and no exception.
++    assert compute_per_source_train_metrics(_make_batch(), data_sources, EXTRA_FIELDS) == {}
++
++
++def test_all_aborted_source_skips_score_and_adv():
++    batch = _make_batch()
++    out = compute_per_source_train_metrics(batch, ["a", "a", "a", "a", "b"])
++    assert out["training_ds/b/n_samples"] == 1
++    assert out["training_ds/b/response_length/mean"] == pytest.approx(0.0)
++    assert out["training_ds/b/token_share"] == pytest.approx(0.0)
++    assert "training_ds/b/score/mean" not in out
++    assert "training_ds/b/advantages/abs_mean" not in out
+diff --git a/tests/trainer/ppo/v1/test_agent_loop_tq_on_cpu.py b/tests/trainer/ppo/v1/test_agent_loop_tq_on_cpu.py
+index 1900194c..617b7b3c 100644
+--- a/tests/trainer/ppo/v1/test_agent_loop_tq_on_cpu.py
++++ b/tests/trainer/ppo/v1/test_agent_loop_tq_on_cpu.py
+@@ -13,8 +13,15 @@
+ # limitations under the License.
+ 
+ import asyncio
++from types import SimpleNamespace
+ 
+-from verl.trainer.ppo.v1.agent_loop_tq import _settle_session_tasks
++import pytest
++from omegaconf import OmegaConf
++
++from verl.experimental.agent_loop.agent_loop import AgentLoopWorker
++from verl.experimental.teacher_loop.teacher_manager import TeacherError
++from verl.trainer.ppo.v1 import agent_loop_tq
++from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopWorkerTQ, _settle_session_tasks
+ 
+ 
+ def test_settle_session_tasks_waits_for_siblings_after_failure():
+@@ -37,3 +44,58 @@ def test_settle_session_tasks_waits_for_siblings_after_failure():
+         assert isinstance(errors[0], RuntimeError)
+ 
+     asyncio.run(run())
++
++
++# teacher errors are fatal ---------------------------------------------------------------------------------
++_run_prompt = AgentLoopWorkerTQ.__ray_metadata__.modified_class._run_prompt
++
++
++def _run(session_error, monkeypatch):
++    puts = []
++
++    async def put(key, partition_id, tag):
++        puts.append(tag)
++
++    monkeypatch.setattr(agent_loop_tq.tq, "async_kv_put", put)
++
++    async def run_agent_loop(*args, **kwargs):
++        if session_error is not None and kwargs["session_id"] == 0:
++            raise session_error
++
++    worker = SimpleNamespace(
++        config=OmegaConf.create({"actor_rollout_ref": {"rollout": {"n": 2, "val_kwargs": {"n": 1}}}}),
++        _run_agent_loop=run_agent_loop,
++    )
++    asyncio.run(_run_prompt(worker, {"uid": "u"}, {}, {"validate": False}))
++    return puts[-1]
++
++
++def test_teacher_error_marks_the_group_fatal_with_the_real_message(monkeypatch):
++    tag = _run(TeacherError("AssertionError: teacher 'a': prompt_logprobs length 3 != sequence length 4"), monkeypatch)
++    assert tag["status"] == "failure"
++    assert "prompt_logprobs length 3 != sequence length 4" in tag["fatal_error"]
++
++
++def test_other_rollout_errors_keep_the_plain_failure_status(monkeypatch):
++    tag = _run(RuntimeError("engine died"), monkeypatch)
++    assert tag["status"] == "failure" and "fatal_error" not in tag
++    assert _run(None, monkeypatch)["status"] == "finished"
++
++
++def _teacher_stub(compute):
++    return SimpleNamespace(
++        distillation_enabled=True,
++        teacher_key="data_source",
++        teacher_server_manager=SimpleNamespace(compute_teacher_logprobs_single=compute, _resolve_teacher_key=lambda k: k),
++    )
++
++
++@pytest.mark.parametrize("error", [AssertionError("length mismatch"), ValueError("No teacher configured for key 'x'")])
++def test_compute_teacher_logprobs_wraps_teacher_errors(error):
++    async def compute(**kwargs):
++        raise error
++
++    output = SimpleNamespace(multi_modal_data=None, mm_processor_kwargs=None, extra_fields={})
++    stub = _teacher_stub(compute)
++    with pytest.raises(TeacherError, match=str(error)):
++        asyncio.run(AgentLoopWorker._compute_teacher_logprobs(stub, output, [1], [2], False, {"data_source": "x"}))
+diff --git a/tests/trainer/ppo/v1/test_metrics_aggregator_on_cpu.py b/tests/trainer/ppo/v1/test_metrics_aggregator_on_cpu.py
+index c788426d..21036fca 100644
+--- a/tests/trainer/ppo/v1/test_metrics_aggregator_on_cpu.py
++++ b/tests/trainer/ppo/v1/test_metrics_aggregator_on_cpu.py
+@@ -198,6 +198,18 @@ def test_dapo_filtered_reward_counts_survive_aggregation():
+     assert out[DAPO_FILTERED_REWARD_COUNTS_KEY] == {0.0: 5, 1.0: 1}
+ 
+ 
++def test_per_source_filter_groups_counts_are_summed_across_iterations():
++    # data_source names must not pick the aggregation (``admin`` contains "min", ``summit`` "sum").
++    agg = MetricsAggregator()
++    for name in ("imgr", "admin", "summit"):
++        agg.add_step_metrics({f"training_ds/{name}/filter_groups/evicted_all_low": 2}, sample_count=4)
++        agg.add_step_metrics({f"training_ds/{name}/filter_groups/evicted_all_low": 3}, sample_count=4)
++    out = agg.get_aggregated_metrics()
++    assert out["training_ds/imgr/filter_groups/evicted_all_low"] == 5
++    assert out["training_ds/admin/filter_groups/evicted_all_low"] == 5
++    assert out["training_ds/summit/filter_groups/evicted_all_low"] == 5
++
++
+ def test_filter_groups_evicted_samples_are_summed_across_iterations():
+     # Per-mini-batch DAPO eviction counts must accumulate, like off_policy/evicted_samples.
+     agg = MetricsAggregator()
+diff --git a/tests/trainer/ppo/v1/test_reissue_inflight_on_cpu.py b/tests/trainer/ppo/v1/test_reissue_inflight_on_cpu.py
+index 11c0ae8d..de6714bc 100644
+--- a/tests/trainer/ppo/v1/test_reissue_inflight_on_cpu.py
++++ b/tests/trainer/ppo/v1/test_reissue_inflight_on_cpu.py
+@@ -212,8 +212,8 @@ def test_add_prompts_to_generate_uses_exact_count():
+     )
+     requested = []
+     submitted = []
+-    stub._next_train_batch = lambda num_prompts: requested.append(num_prompts) or batch
+-    stub._submit_batch_to_rollout = lambda value: submitted.append(value) or len(value)
++    stub._next_train_batch = lambda num_prompts, global_steps=None: requested.append(num_prompts) or batch
++    stub._submit_batch_to_rollout = lambda value, global_steps=None: submitted.append(value) or len(value)
+     stub._add_prompts_to_generate = PPOTrainer._add_prompts_to_generate.__get__(stub)
+ 
+     assert stub._add_prompts_to_generate(3) == 3
+@@ -470,3 +470,20 @@ def test_reissue_short_circuits_when_checkpoint_unsupported(tq_init, partition_i
+         assert stub.agent_loop_manager.batches == []
+     finally:
+         _clear_partition(partition_id)
++
++
++def test_submit_batch_tags_prompts_with_requested_global_steps(monkeypatch):
++    """Warmup prompts are tagged ``global_steps - 1``; the default tag is the current step."""
++    stub = type("Stub", (), {})()
++    stub.trainer_mode = "colocate_async"
++    stub.global_steps = 7
++    stub.agent_loop_manager = type("M", (), {"generate_sequences": lambda self, batch: None})()
++    batch = tu.get_tensordict({"uid": [_uid(), _uid()], "raw_prompt": ["a", "b"], "index": torch.tensor([0, 1])})
++    puts = []
++    monkeypatch.setattr(trainer_base.tq, "kv_batch_put", lambda **kwargs: puts.append(kwargs))
++    submit = PPOTrainer._submit_batch_to_rollout.__get__(stub)
++
++    submit(batch)
++    submit(batch, global_steps=stub.global_steps - 1)
++    assert [t["global_steps"] for t in puts[0]["tags"]] == [7, 7]
++    assert [t["global_steps"] for t in puts[1]["tags"]] == [6, 6]
+diff --git a/tests/trainer/ppo/v1/test_replay_buffer_lost_rows_on_cpu.py b/tests/trainer/ppo/v1/test_replay_buffer_lost_rows_on_cpu.py
+new file mode 100644
+index 00000000..9a9c0f1a
+--- /dev/null
++++ b/tests/trainer/ppo/v1/test_replay_buffer_lost_rows_on_cpu.py
+@@ -0,0 +1,44 @@
++# A finished group whose TransferQueue rows were lost (kv_clear index-reuse race) is dropped, not fatal.
++from collections import Counter, defaultdict
++
++import verl.trainer.ppo.v1.replay_buffer as rb
++
++
++def _buffer():
++    b = object.__new__(rb.ReplayBuffer)
++    b.filter_groups_metric = "acc"
++    b.partitions = defaultdict(dict)
++    for name in ("pending_keys", "running_keys", "finished_keys", "failure_keys"):
++        setattr(b, name, defaultdict(set))
++    b.prompt_global_steps = defaultdict(dict)
++    b._dapo_classification_cache = defaultdict(dict)
++    b.lost_group_count = Counter()
++    return b
++
++
++def test_lost_rows_drop_group(monkeypatch):
++    store, cleared = {}, []
++
++    def kv_batch_get(keys, partition_id, select_fields):
++        if any(k not in store for k in keys):
++            raise RuntimeError("StorageUnitData get_data: key 956 not found in field 'extra_fields'")
++        return {"extra_fields": [store[k] for k in keys]}
++
++    monkeypatch.setattr(rb.tq, "kv_batch_get", kv_batch_get)
++    monkeypatch.setattr(rb.tq, "kv_clear", lambda partition_id, keys: cleared.extend(keys))
++    b = _buffer()
++    for uid, accs in (("A", [1, 1]), ("B", [0, 1]), ("C", [1, 0])):
++        b.finished_keys["train"].add(uid)
++        for i, acc in enumerate(accs):
++            key = f"{uid}_0_{i}"
++            b.partitions["train"][key] = {}
++            if not (uid == "C" and i == 1):  # C lost one row
++                store[key] = {"reward_extra_info": {"acc": acc}}
++
++    uids, counts = b._dapo_filtered_keys("train")
++    assert uids == {"A"} and counts == {1.0: 1}
++    assert b.lost_group_count["train"] == 1
++    assert set(cleared) == {"C", "C_0_0", "C_0_1"}
++    assert "C" not in b.finished_keys["train"] and "C_0_0" not in b.partitions["train"]
++    assert b._dapo_classification_cache["train"]["B"] is None
++    assert b._dapo_filtered_keys("train")[0] == {"A"}  # next poll reads nothing new
+diff --git a/tests/trainer/ppo/v1/test_replay_buffer_on_cpu.py b/tests/trainer/ppo/v1/test_replay_buffer_on_cpu.py
+index 4e3f5bf9..d43973f0 100644
+--- a/tests/trainer/ppo/v1/test_replay_buffer_on_cpu.py
++++ b/tests/trainer/ppo/v1/test_replay_buffer_on_cpu.py
+@@ -147,6 +147,7 @@ class PromptSpec:
+     global_steps: int = 0
+     rewards: list[float] | None = None
+     canonical_rewards: list[float | list[float]] | None = None
++    data_source: str | None = None
+     trajectory_keys: list[str] = field(default_factory=list)
+ 
+ 
+@@ -168,6 +169,8 @@ class RolloutProducer(threading.Thread):
+                     tag = {"is_prompt": False, "seq_len": 3, "global_steps": spec.global_steps}
+                     if spec.rewards is not None:
+                         fields["extra_fields"] = {"reward_extra_info": {"acc": float(spec.rewards[session_id])}}
++                    if spec.data_source is not None:
++                        fields["data_source"] = spec.data_source
+                     if spec.canonical_rewards is not None:
+                         reward = spec.canonical_rewards[session_id]
+                         fields["rm_scores"] = torch.tensor(
+@@ -673,6 +676,49 @@ def test_wait_blocks_until_stale_inflight_finishes(tq_init, partition_id):
+         _clear_partition(partition_id)
+ 
+ 
++def test_wait_holds_first_step_for_warmup_prompts_tagged_one_step_older(tq_init, partition_id):
++    """Warmup prompts carry ``global_steps - 1`` (0 at step 1): wait blocks step 1 until they finish
++    (no negative step, no deadlock) and the sample takes them first instead of the first-finished short ones."""
++    threshold, g = 2, 1
++    step_prompts = [PromptSpec(uid=_uid(), status="finished", sessions=1, global_steps=g) for _ in range(2)]
++    warmup = [PromptSpec(uid=_uid(), status="running", sessions=1, global_steps=g - 1) for _ in range(2)]
++    _produce(partition_id, step_prompts + warmup).join_and_check()
++
++    rb = _make_rb(trainer_mode="colocate_async", max_off_policy_strategy="wait", max_off_policy_threshold=threshold)
++    consumer = SampleConsumer(rb, partition_id, batch_size=2, global_steps=g)
++    try:
++        consumer.start()
++        time.sleep(POLL_INTERVAL * 5)
++        assert consumer.is_alive(), "step 1 must wait for the warmup prompts"
++
++        for spec in warmup:
++            _set_prompt_status(partition_id, spec.uid, "finished", global_steps=g - 1)
++
++        batch = consumer.result_or_raise()
++        assert _uids_of(batch.keys) == {spec.uid for spec in warmup}
++    finally:
++        consumer.join(timeout=10.0)
++        _clear_partition(partition_id)
++
++
++def test_teacher_fatal_error_tag_raises_instead_of_evicting(tq_init, partition_id):
++    """A group tagged ``fatal_error`` (teacher error) fails the run with its message, no evict/refill."""
++    refiller = FakeRefiller(partition_id, global_steps=1)
++    rb = _make_rb(trainer_mode="colocate_async", refill_fn=refiller)
++    uid = _uid()
++    tq.kv_put(
++        key=uid,
++        partition_id=partition_id,
++        tag={"is_prompt": True, "status": "failure", "global_steps": 1, "fatal_error": "teacher error: boom"},
++    )
++    try:
++        with pytest.raises(RuntimeError, match="teacher error: boom"):
++            _sample(rb, partition_id, batch_size=1, global_steps=1)
++        assert refiller.calls == []
++    finally:
++        _clear_partition(partition_id)
++
++
+ def test_wait_keeps_stale_terminal_trajectories(tq_init, partition_id):
+     """wait is dropless: a finished-but-very-stale group that ``drop`` would
+     discard is still returned, with no drop metrics."""
+@@ -1038,6 +1084,57 @@ def test_dapo_reports_filtered_reward_value_breakdown(tq_init, partition_id):
+         _clear_partition(partition_id)
+ 
+ 
++def test_dapo_eviction_counts_split_by_data_source(tq_init):
++    """Evicted groups are counted per data_source as all_high (shared acc > 0) or all_low."""
++    pid = "train"
++    specs = [
++        PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[1.0, 1.0], data_source="imgr"),
++        PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[1.0, 1.0], data_source="imgr"),
++        PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[0.0, 0.0], data_source="imgr"),
++        PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[0.0, 0.0], data_source="vid"),
++        PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[0.0, 1.0], data_source="vid"),
++    ]
++    _produce(pid, specs).join_and_check()
++
++    rb = _make_rb(trainer_mode="colocate_async", filter_groups_metric="acc", refill_fn=lambda _n: None)
++    try:
++        rb._sync_metadata_from_transfer_queue()
++        reasons = rb._terminal_eviction_reasons(global_steps=0, partition_id=pid)
++        _evicted, _stale_count, dapo_count, metrics = rb._evict_terminal_groups(
++            global_steps=0, partition_id=pid, eviction_reasons=reasons
++        )
++        assert dapo_count == 4
++        assert metrics["training/filter_groups/evicted_samples"] == 4
++        by_source = {k: v for k, v in metrics.items() if k.startswith("training_ds/")}
++        assert by_source == {
++            "training_ds/imgr/filter_groups/evicted_all_high": 2,
++            "training_ds/imgr/filter_groups/evicted_all_low": 1,
++            "training_ds/vid/filter_groups/evicted_all_low": 1,
++        }
++    finally:
++        _clear_partition(pid)
++
++
++def test_dapo_eviction_without_data_source_emits_no_per_source_counts(tq_init, partition_id):
++    """Rows without data_source: the per-source counts are skipped and the eviction itself is unchanged."""
++    all_zero = PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[0.0, 0.0])
++    all_one = PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[1.0, 1.0])
++    _produce(partition_id, [all_zero, all_one]).join_and_check()
++
++    rb = _make_rb(trainer_mode="colocate_async", filter_groups_metric="acc", refill_fn=lambda _n: None)
++    try:
++        rb._sync_metadata_from_transfer_queue()
++        reasons = rb._terminal_eviction_reasons(global_steps=0, partition_id=partition_id)
++        evicted, _stale_count, dapo_count, metrics = rb._evict_terminal_groups(
++            global_steps=0, partition_id=partition_id, eviction_reasons=reasons
++        )
++        assert dapo_count == 2 and evicted == {all_zero.uid, all_one.uid}
++        assert metrics["validation/filter_groups/evicted_samples"] == 2
++        assert not [k for k in metrics if "_ds/" in k]
++    finally:
++        _clear_partition(partition_id)
++
++
+ def test_sync_dapo_refills_twice_and_clears_surplus(tq_init, partition_id):
+     all_same = PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[0.0, 0.0])
+     mixed = PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[0.0, 1.0])
+diff --git a/tests/trainer/ppo/v1/test_resume_dataloader_snapshot_on_cpu.py b/tests/trainer/ppo/v1/test_resume_dataloader_snapshot_on_cpu.py
+new file mode 100644
+index 00000000..c264be20
+--- /dev/null
++++ b/tests/trainer/ppo/v1/test_resume_dataloader_snapshot_on_cpu.py
+@@ -0,0 +1,93 @@
++# Copyright 2026 The M3OPD-Reasoner Authors
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Resume must re-yield the prefetched, untrained prompts when the TQ buffer cannot be checkpointed."""
++
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++import torch
++from omegaconf import OmegaConf
++from torchdata.stateful_dataloader import StatefulDataLoader
++
++from verl.trainer.ppo.v1 import trainer_base
++from verl.trainer.ppo.v1.trainer_base import PPOTrainer
++
++N_PROMPTS, TRAIN_BS = 40, 4
++
++
++def _collate(rows):
++    return {"raw_prompt": np.array([r for r in rows], dtype=object), "id": torch.tensor(rows)}
++
++
++def _stub(gen_bs, state=None, base_step=0, trainer_mode="colocate_async"):
++    dl = StatefulDataLoader(list(range(N_PROMPTS)), batch_size=gen_bs, shuffle=True, collate_fn=_collate,
++                           generator=torch.Generator().manual_seed(7))
++    if state is not None:
++        dl.load_state_dict(state)
++    stub = SimpleNamespace(
++        config=OmegaConf.create({"data": {"train_batch_size": TRAIN_BS}}),
++        train_dataloader=dl,
++        train_dataloader_it=None,
++        trainer_mode=trainer_mode,
++        global_steps=base_step + 1,
++        _dl_snapshots={},
++        _dl_fetched=0,
++        _dl_base_step=base_step,
++    )
++    stub._fetch_one_gen_batch = PPOTrainer._fetch_one_gen_batch.__get__(stub)
++    stub._dataloader_state_for_save = PPOTrainer._dataloader_state_for_save.__get__(stub)
++    return stub
++
++
++def _draw(stub, num_prompts, gen_bs):
++    ids = []
++    for _ in range(num_prompts // gen_bs):
++        ids += stub._fetch_one_gen_batch()["id"].tolist()
++    return ids
++
++
++@pytest.mark.parametrize("gen_bs", [4, 2])
++def test_resume_re_yields_untrained_prefetched_prompts(monkeypatch, gen_bs):
++    monkeypatch.setattr(trainer_base, "_tq_supports_checkpoint", lambda: False)
++    run = _stub(gen_bs)
++    fetched = _draw(run, TRAIN_BS, gen_bs)  # warmup window: one batch ahead
++    trained, save_step = [], 3
++    for step in range(1, save_step + 1):
++        run.global_steps = step
++        fetched += _draw(run, TRAIN_BS, gen_bs)  # prepare_step prefetch: window is 2 batches during step
++        trained += fetched[(step - 1) * TRAIN_BS : step * TRAIN_BS]  # in-order consumption
++    run.global_steps = save_step
++    state = run._dataloader_state_for_save()
++    # the current position is past the prefetched batches; the saved one is not.
++    assert run.train_dataloader.state_dict() != state
++
++    resumed = _stub(gen_bs, state=state, base_step=save_step)
++    after = _draw(resumed, TRAIN_BS, gen_bs)
++    for step in range(save_step + 1, save_step + 4):
++        resumed.global_steps = step
++        after += _draw(resumed, TRAIN_BS, gen_bs)
++    trained_after = after[: 3 * TRAIN_BS]
++    seen = trained + trained_after
++    assert len(seen) == len(set(seen)) == (save_step + 3) * TRAIN_BS
++    assert seen == fetched[: save_step * TRAIN_BS] + trained_after
++    assert after[:TRAIN_BS] == fetched[save_step * TRAIN_BS : (save_step + 1) * TRAIN_BS]
++
++
++def test_tq_checkpoint_support_keeps_current_position(monkeypatch):
++    monkeypatch.setattr(trainer_base, "_tq_supports_checkpoint", lambda: True)
++    run = _stub(4)
++    _draw(run, 2 * TRAIN_BS, 4)
++    run.global_steps = 1
++    assert run._dataloader_state_for_save() == run.train_dataloader.state_dict()
+diff --git a/tests/trainer/ppo/v1/test_separate_async_activity_metrics_on_cpu.py b/tests/trainer/ppo/v1/test_separate_async_activity_metrics_on_cpu.py
+new file mode 100644
+index 00000000..a52ff1db
+--- /dev/null
++++ b/tests/trainer/ppo/v1/test_separate_async_activity_metrics_on_cpu.py
+@@ -0,0 +1,127 @@
++# Copyright 2026 The M3OPD-Reasoner Authors
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""CPU tests for the separate_async trainer / buffer / rollout activity metrics."""
++
++from types import SimpleNamespace
++
++import pytest
++from omegaconf import OmegaConf
++
++import verl.trainer.ppo.v1.replay_buffer as rb_module
++from verl.trainer.ppo.v1.async_metrics import rollout_window_metrics
++from verl.trainer.ppo.v1.replay_buffer import ReplayBufferAsync
++from verl.trainer.ppo.v1.trainer_separate_async import PPOTrainerSeparateAsync
++
++P = "separate_async/rollout"
++
++
++def test_window_metrics_union_concurrency_latency_tokens():
++    # window [0, 10]: groups busy on [1, 4] and [3, 6] -> busy 5 s; one still running from 8
++    groups = [(1.0, 4.0, 100), (3.0, 6.0, 300), (8.0, None, 999), (-5.0, -1.0, 7)]
++    m = rollout_window_metrics(groups, 0.0, 10.0, n_rollout_gpus=2)
++    assert m[f"{P}/idle_ratio"] == pytest.approx(1 - 7 / 10)  # [1, 6] + [8, 10]
++    assert m[f"{P}/inflight_groups_mean"] == pytest.approx((3 + 3 + 2) / 10)
++    assert m[f"{P}/groups_finished"] == 2  # the group that ended before the window does not count
++    assert m[f"{P}/group_latency_mean_s"] == pytest.approx(3.0)
++    assert m[f"{P}/group_latency_max_s"] == pytest.approx(3.0)
++    assert m[f"{P}/gen_tokens_per_s_per_gpu"] == pytest.approx(400 / 10 / 2)
++
++
++def test_window_metrics_empty_and_degenerate_window():
++    m = rollout_window_metrics([], 0.0, 5.0, n_rollout_gpus=4)
++    assert m[f"{P}/idle_ratio"] == 1.0 and m[f"{P}/inflight_groups_mean"] == 0.0
++    assert f"{P}/group_latency_mean_s" not in m
++    assert rollout_window_metrics([(0.0, 1.0, 1)], 3.0, 3.0, n_rollout_gpus=4) == {}
++
++
++def _rb():
++    return ReplayBufferAsync(
++        trainer_mode="separate_async",
++        trainer_config=OmegaConf.create({}),
++        max_off_policy_threshold=2,
++        max_off_policy_strategy="drop",
++        sampler_kwargs=OmegaConf.create({}),
++    )
++
++
++def test_buffer_collects_stamps_and_tokens_and_prunes(monkeypatch):
++    listing = {
++        "train": {
++            "a": {"is_prompt": True, "status": "finished", "global_steps": 1, "rollout_start_ts": 1.0,
++                  "rollout_end_ts": 4.0},
++            "a_0_0": {"is_prompt": False, "status": "success", "response_len": 10},
++            "a_1_0": {"is_prompt": False, "status": "success", "response_len": 30},
++            "b": {"is_prompt": True, "status": "running", "global_steps": 1, "rollout_start_ts": 3.0,
++                  "rollout_end_ts": 2.0},  # stale end stamp of a reissued group
++            "c": {"is_prompt": True, "status": "pending", "global_steps": 1},
++        }
++    }
++    monkeypatch.setattr(rb_module.tq, "kv_list", lambda: listing)
++    rb = _rb()
++    rb._sync_metadata_from_transfer_queue()
++    assert rb.inflight_count("train") == 2
++    assert set(rb.rollout_groups) == {"a", "b"}
++    assert rb.rollout_groups["b"]["end"] is None
++
++    m = rb.rollout_activity(0.0, 10.0, n_rollout_gpus=1)
++    assert m[f"{P}/groups_finished"] == 1
++    assert m[f"{P}/gen_tokens_per_s_per_gpu"] == pytest.approx(40 / 10)
++    assert m[f"{P}/idle_ratio"] == pytest.approx(0.1)  # [1, 10] busy, [0, 1] idle
++    assert set(rb.rollout_groups) == {"b"}  # finished group pruned
++
++    # "a" is seen again (not consumed yet): it ended before the next window, so it adds nothing
++    rb._sync_metadata_from_transfer_queue()
++    m = rb.rollout_activity(10.0, 20.0, n_rollout_gpus=1)
++    assert m[f"{P}/groups_finished"] == 0
++    assert m[f"{P}/idle_ratio"] == pytest.approx(0.0)  # "b" still running
++
++
++class _Buffer:
++    def __init__(self):
++        self.calls = []
++
++    def get_sampleable_count(self, global_steps, partition_id):
++        self.calls.append(global_steps)
++        return 64 if global_steps == 5 else 128
++
++    def inflight_count(self, partition_id):
++        return 300
++
++    def rollout_activity(self, window_start, window_end, n_rollout_gpus):
++        return {f"{P}/n_gpus_seen": float(n_rollout_gpus)}
++
++
++def test_trainer_activity_metrics(monkeypatch):
++    trainer = object.__new__(PPOTrainerSeparateAsync)
++    trainer.config = OmegaConf.create({"actor_rollout_ref": {"rollout": {"nnodes": 2, "n_gpus_per_node": 8}}})
++    trainer.replay_buffer = _Buffer()
++    trainer.global_steps = 5
++    clock = SimpleNamespace(t=100.0)
++    monkeypatch.setattr("verl.trainer.ppo.v1.trainer_separate_async.time.time", lambda: clock.t)
++
++    trainer._activity_window_start = 50.0
++    trainer._step_wall_start = clock.t
++    trainer._step_start_buffer_metrics = trainer._buffer_metrics("step_start", trainer.global_steps)
++    trainer._step_sample_wait_seconds = 25.0
++    clock.t = 200.0
++    m = trainer._async_activity_metrics()
++
++    assert m["separate_async/buffer/ready_groups_step_start"] == 64
++    assert m["separate_async/buffer/ready_groups_step_end"] == 128  # counted for the next step
++    assert m["separate_async/buffer/inflight_groups_step_start"] == 300
++    assert m["separate_async/trainer/wait_s"] == 25.0
++    assert m["separate_async/trainer/idle_ratio"] == pytest.approx(0.25)
++    assert m[f"{P}/n_gpus_seen"] == 16
++    assert trainer._activity_window_start == 200.0
++    assert trainer.replay_buffer.calls == [5, 6]
+diff --git a/tests/trainer/ppo/v1/test_truncation_on_cpu.py b/tests/trainer/ppo/v1/test_truncation_on_cpu.py
+new file mode 100644
+index 00000000..4cc93224
+--- /dev/null
++++ b/tests/trainer/ppo/v1/test_truncation_on_cpu.py
+@@ -0,0 +1,213 @@
++# Copyright 2026 The M3OPD-Reasoner Authors
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""CPU tests: truncated-response detection, masking, per-domain rollout metrics, all-masked loss guard."""
++
++import math
++import numpy as np
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from verl.trainer.ppo.core_algos import agg_loss
++from verl.trainer.ppo.v1.truncation import (
++    apply_truncation_mask,
++    collect_eos_ids,
++    domain_rollout_metrics,
++    is_truncated_response,
++)
++
++EOS = {99, 98}
++CAP = 8
++
++
++def test_collect_eos_ids_union():
++    tok = SimpleNamespace(eos_token_id=99)
++    gen = SimpleNamespace(eos_token_id=[98, 97])
++    assert collect_eos_ids(tok, gen, [5]) == {99, 98, 97, 5}
++    assert collect_eos_ids(None, None, None) == set()
++
++
++def test_collect_eos_ids_listconfig():
++    # rollout.stop_token_ids arrives as an OmegaConf ListConfig (int(ListConfig) crashed)
++    from omegaconf import OmegaConf
++
++    cfg = OmegaConf.create({"stop_token_ids": [7, 8]})
++    assert collect_eos_ids(SimpleNamespace(eos_token_id=99), None, cfg.stop_token_ids) == {99, 7, 8}
++    assert collect_eos_ids(None, None, np.array([3, 4])) == {3, 4}
++
++
++def test_eos_at_cap_not_truncated():
++    assert not is_truncated_response([1] * (CAP - 1) + [99], EOS, CAP, finish_reason="stop")
++    assert not is_truncated_response([1] * (CAP - 1) + [98], EOS, CAP)
++
++
++def test_no_eos_at_cap_truncated():
++    assert is_truncated_response([1] * CAP, EOS, CAP)
++    assert is_truncated_response([1] * CAP, EOS, CAP, finish_reason="length")
++
++
++def test_short_response_not_truncated():
++    assert not is_truncated_response([1, 2, 99], EOS, CAP, finish_reason="stop")
++    assert not is_truncated_response([1, 2, 3], EOS, CAP)  # no EOS but no length limit hit and no reason
++
++
++def test_backend_length_reason_and_max_model_len():
++    assert is_truncated_response([1, 2, 3], EOS, CAP, finish_reason="length")
++    assert is_truncated_response([1, 2, 3], EOS, CAP, prompt_len=97, max_model_len=100)
++    assert not is_truncated_response([1, 2, 99], EOS, CAP, prompt_len=97, max_model_len=100)
++    assert not is_truncated_response([1, 2, 3], EOS, CAP, prompt_len=10, max_model_len=100)
++
++
++def test_apply_truncation_mask():
++    m = [1, 1, 0, 1]
++    assert apply_truncation_mask(m, True, True) == [0, 0, 0, 0]
++    assert apply_truncation_mask(m, True, False) == m
++    assert apply_truncation_mask(m, False, True) == m
++
++
++def test_domain_metrics_values_and_unknown():
++    out = domain_rollout_metrics(
++        domains=["imgr", "imgr", None, "vid"],
++        response_lens=[10, 30, 20, 40],
++        truncated=[False, True, False, True],
++        masked=[False, True, False, True],
++        think_closed=[True, False, None, False],
++    )
++    assert out["mopd_trunc/frac_truncated"] == 0.5
++    assert out["mopd_trunc/frac_masked"] == 0.5
++    assert out["mopd_trunc/masked_token_frac"] == pytest.approx(70 / 100)
++    assert out["mopd_trunc/all_masked_batch"] == 0.0
++    assert out["mopd_domain/imgr/n"] == 2
++    assert out["mopd_domain/imgr/token_share"] == pytest.approx(0.4)
++    assert out["mopd_domain/imgr/resp_len_mean"] == 20.0
++    assert out["mopd_domain/imgr/resp_len_max"] == 30.0
++    assert out["mopd_domain/imgr/resp_len_p90"] == pytest.approx(28.0)
++    assert out["mopd_domain/imgr/trunc_rate"] == 0.5
++    assert out["mopd_domain/imgr/think_close_rate"] == 0.5
++    assert out["mopd_domain/imgr/masked_token_frac"] == pytest.approx(30 / 40)
++    assert out["mopd_domain/unknown/n"] == 1
++    assert "mopd_domain/unknown/think_close_rate" not in out  # token id unknown -> skipped
++    assert out["mopd_domain/vid/masked_frac"] == 1.0
++
++
++def test_domain_metrics_without_think_and_empty():
++    out = domain_rollout_metrics(["a"], [5], [False], [False])
++    assert "mopd_domain/a/think_close_rate" not in out
++    assert domain_rollout_metrics([], [], [], []) == {}
++
++
++def test_all_truncated_batch_guard():
++    out = domain_rollout_metrics(["a", "b"], [8, 8], [True, True], [True, True])
++    assert out["mopd_trunc/all_masked_batch"] == 1.0
++    assert out["mopd_trunc/masked_token_frac"] == 1.0
++    # fully masked global batch: batch_num_tokens == 0 must give loss 0, not NaN
++    loss_mat = torch.ones(2, CAP, requires_grad=True)
++    mask = torch.zeros(2, CAP)
++    for n_tokens in (None, 0, torch.tensor(0)):
++        loss = agg_loss(loss_mat, mask, loss_agg_mode="token-mean", batch_num_tokens=n_tokens)
++        assert not math.isnan(loss.item()) and loss.item() == 0.0
++    loss.backward()
++    assert torch.count_nonzero(loss_mat.grad) == 0
++
++
++def test_agg_loss_token_mean_unchanged_when_tokens_present():
++    loss_mat = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
++    mask = torch.tensor([[1.0, 1.0], [0.0, 0.0]])
++    assert agg_loss(loss_mat, mask, "token-mean").item() == pytest.approx(1.5)
++    assert agg_loss(loss_mat, mask, "token-mean", batch_num_tokens=4).item() == pytest.approx(0.75)
++
++
++def test_loss_range_all_masked_micro_batch():
++    # A micro-batch holding only a truncated (fully masked) response crashed on min() of an empty tensor
++    from verl.trainer.distillation.losses import compute_distillation_loss_range
++
++    losses = torch.rand(1, 6)
++    from verl.utils.metric.utils import Metric
++
++    empty = compute_distillation_loss_range(losses, torch.zeros(1, 6, dtype=torch.bool))
++    full = compute_distillation_loss_range(losses, torch.ones(1, 6, dtype=torch.bool))
++    assert set(empty) == set(full) == {"distillation/loss_min", "distillation/loss_max"}
++    # Every rank must report one value per micro-batch; neutral values leave min/max unchanged
++    for k in empty:
++        agg = Metric.aggregate_dp([empty[k], full[k]])
++        assert agg == full[k].aggregate()
++    out = compute_distillation_loss_range(losses, torch.tensor([[1, 1, 0, 0, 0, 0]], dtype=torch.bool))
++    assert set(out) == {"distillation/loss_min", "distillation/loss_max"}
++
++
++def test_rollout_domain_metrics_linkedlist_fields(monkeypatch):
++    # TransferQueue returns non-tensor fields as a tensordict LinkedList, which has no .tolist()
++    from tensordict import TensorDict
++    from tensordict.utils import LinkedList
++
++    import verl.trainer.ppo.v1.trainer_base as tb
++
++    td = TensorDict({}, batch_size=[])
++    fields = {
++        "data_source": LinkedList(["imgr", "vid"], td=td),
++        "extra_fields": LinkedList([{"truncated": True, "truncation_masked": True}, {}], td=td),
++    }
++    monkeypatch.setattr(tb.tq, "kv_batch_get", lambda keys, partition_id, select_fields: fields)
++    batch = SimpleNamespace(keys=["a", "b"], partition_id="p", tags=[{"response_len": 8}, {"response_len": 4}])
++    out = tb.PPOTrainer._rollout_domain_metrics(None, batch, np.array([True, True]))
++    assert out["mopd_trunc/frac_truncated"] == 0.5
++    assert "mopd_domain/imgr/token_share" in out and "mopd_domain/vid/token_share" in out
++
++
++def test_per_source_train_metrics_linkedlist_fields_and_missing_data_source(monkeypatch):
++    # training_ds/<ds>/* from LinkedList fields; a batch without data_source gives {} and never raises
++    from tensordict import TensorDict
++    from tensordict.utils import LinkedList
++
++    import verl.trainer.ppo.v1.trainer_base as tb
++    from verl import DataProto
++
++    n, width = 2, 4
++    mask = torch.tensor([[1, 1, 1, 1], [1, 1, 0, 0]], dtype=torch.float32)
++    batch = DataProto(
++        batch=TensorDict(
++            {
++                "responses": torch.zeros(n, width, dtype=torch.int64),
++                "response_mask": mask,
++                "token_level_scores": mask * torch.tensor([[1.0], [0.0]]),
++                "advantages": mask * torch.tensor([[1.0], [-1.0]]),
++                "prompt_length": torch.full((n,), 3.0),
++                "response_length": torch.tensor([4.0, 2.0]),
++            },
++            batch_size=[n],
++        )
++    )
++    td = TensorDict({}, batch_size=[])
++    fields = {
++        "data_source": LinkedList(["imgr", "vid"], td=td),
++        "extra_fields": LinkedList([{"reward_extra_info": {"acc": 1.0}}, {"reward_extra_info": {"acc": 0.0}}], td=td),
++    }
++    monkeypatch.setattr(tb.tq, "kv_batch_get", lambda keys, partition_id, select_fields: fields)
++    rollout = SimpleNamespace(response_length=4)
++    trainer = SimpleNamespace(config=SimpleNamespace(actor_rollout_ref=SimpleNamespace(rollout=rollout)))
++    kv_batch = SimpleNamespace(keys=["a", "b"], partition_id="p")
++    out = tb.PPOTrainer._per_source_train_metrics(trainer, kv_batch, np.array([True, True]), batch)
++    assert out["training_ds/imgr/n_samples"] == 1 and out["training_ds/vid/n_samples"] == 1
++    assert out["training_ds/imgr/score/mean"] == 4.0 and out["training_ds/vid/score/mean"] == 0.0
++    assert out["training_ds/imgr/acc/mean"] == 1.0 and out["training_ds/vid/acc/mean"] == 0.0
++    assert out["training_ds/imgr/response_length/clip_ratio"] == 1.0
++    assert out["training_ds/vid/response_length/clip_ratio"] == 0.0
++    assert out["training_ds/vid/advantages/abs_mean"] == 1.0
++
++    def _raise(keys, partition_id, select_fields):
++        raise KeyError("data_source")
++
++    monkeypatch.setattr(tb.tq, "kv_batch_get", _raise)
++    assert tb.PPOTrainer._per_source_train_metrics(trainer, kv_batch, np.array([True, True]), batch) == {}
+diff --git a/tests/trainer/ppo/v1/test_v1_async_alignment_on_cpu.py b/tests/trainer/ppo/v1/test_v1_async_alignment_on_cpu.py
+index e83648c1..214cf7a9 100644
+--- a/tests/trainer/ppo/v1/test_v1_async_alignment_on_cpu.py
++++ b/tests/trainer/ppo/v1/test_v1_async_alignment_on_cpu.py
+@@ -70,13 +70,14 @@ class TestUnconfiguredDefaultsPreserveBehavior:
+         stub = SimpleNamespace(
+             config=OmegaConf.create({"skip": {"rollout_tq": {"enable": False}}, "data": {"train_batch_size": 64}}),
+             _restored_tq_prompt_count=0,
++            global_steps=1,
+         )
+         stub._add_prompts_to_generate = MagicMock()
+         stub._add_async_warmup_batches = PPOTrainer._add_async_warmup_batches.__get__(stub)
+         for num_warmup_batches in (1, 2, 3):
+             stub._add_prompts_to_generate.reset_mock()
+             stub._add_async_warmup_batches(num_warmup_batches)
+-            stub._add_prompts_to_generate.assert_called_once_with(num_warmup_batches * 64)
++            stub._add_prompts_to_generate.assert_called_once_with(num_warmup_batches * 64, global_steps=0)
+ 
+     def test_default_off_policy_threshold_keeps_staleness_control(self):
+         # The default (int) threshold still enables drop/wait as before.
+@@ -205,6 +206,7 @@ class TestFractionalWarmup:
+         stub = SimpleNamespace(
+             config=OmegaConf.create({"skip": {"rollout_tq": {"enable": False}}, "data": data}),
+             _restored_tq_prompt_count=restored,
++            global_steps=1,
+         )
+         stub._add_prompts_to_generate = MagicMock()
+         stub._add_async_warmup_batches = PPOTrainer._add_async_warmup_batches.__get__(stub)
+@@ -214,18 +216,18 @@ class TestFractionalWarmup:
+         # 1.5 x 64 = 96 prompts, already a whole number of gen_batch_size=32 chunks.
+         stub = self._warmup_stub(train_batch_size=64, gen_batch_size=32)
+         stub._add_async_warmup_batches(1.5)
+-        stub._add_prompts_to_generate.assert_called_once_with(96)
++        stub._add_prompts_to_generate.assert_called_once_with(96, global_steps=0)
+ 
+     def test_fraction_below_one_chunk_is_dropped(self):
+         # 1.25 x 64 = 80 prompts -> 80 // 64 * 64 = 64 (gen_batch_size=64).
+         stub = self._warmup_stub(train_batch_size=64, gen_batch_size=64)
+         stub._add_async_warmup_batches(1.25)
+-        stub._add_prompts_to_generate.assert_called_once_with(64)
++        stub._add_prompts_to_generate.assert_called_once_with(64, global_steps=0)
+ 
+     def test_integer_warmup_unchanged_without_gen_batch_size(self):
+         stub = self._warmup_stub(train_batch_size=64)
+         stub._add_async_warmup_batches(2)
+-        stub._add_prompts_to_generate.assert_called_once_with(128)
++        stub._add_prompts_to_generate.assert_called_once_with(128, global_steps=0)
+ 
+ 
+ class TestOffPolicyThresholdNone:
+diff --git a/tests/trainer/ppo/v1/test_v1_async_warmup_on_cpu.py b/tests/trainer/ppo/v1/test_v1_async_warmup_on_cpu.py
+index 6b6a1035..76f0356f 100644
+--- a/tests/trainer/ppo/v1/test_v1_async_warmup_on_cpu.py
++++ b/tests/trainer/ppo/v1/test_v1_async_warmup_on_cpu.py
+@@ -50,6 +50,7 @@ def _stub(
+             }
+         ),
+         _restored_tq_prompt_count=restored_tq_prompt_count,
++        global_steps=1,
+     )
+     stub._add_prompts_to_generate = MagicMock()
+     stub._add_async_warmup_batches = PPOTrainer._add_async_warmup_batches.__get__(stub)
+@@ -59,7 +60,7 @@ def _stub(
+ def test_fresh_start_submits_the_whole_prefetch_window():
+     stub = _stub(restored_tq_prompt_count=0)
+     stub._add_async_warmup_batches(3)
+-    stub._add_prompts_to_generate.assert_called_once_with(12)
++    stub._add_prompts_to_generate.assert_called_once_with(12, global_steps=0)
+ 
+ 
+ def test_full_restored_prompt_pool_skips_warmup():
+@@ -71,7 +72,7 @@ def test_full_restored_prompt_pool_skips_warmup():
+ def test_partial_restored_prompt_pool_is_topped_up():
+     stub = _stub(restored_tq_prompt_count=6)
+     stub._add_async_warmup_batches(3)
+-    stub._add_prompts_to_generate.assert_called_once_with(6)
++    stub._add_prompts_to_generate.assert_called_once_with(6, global_steps=0)
+ 
+ 
+ def test_overfilled_restored_prompt_pool_does_not_add_warmup():
+@@ -96,14 +97,14 @@ def test_colocate_async_on_train_begin_tops_up_configured_window():
+     stub = _stub(restored_tq_prompt_count=4, num_warmup_batches=3)
+     stub.on_train_begin = PPOTrainerColocateAsync.on_train_begin.__get__(stub)
+     stub.on_train_begin()
+-    stub._add_prompts_to_generate.assert_called_once_with(8)
++    stub._add_prompts_to_generate.assert_called_once_with(8, global_steps=0)
+ 
+ 
+ def test_separate_async_on_train_begin_tops_up_configured_window():
+     stub = _stub(restored_tq_prompt_count=0, num_warmup_batches=2)
+     stub.on_train_begin = PPOTrainerSeparateAsync.on_train_begin.__get__(stub)
+     stub.on_train_begin()
+-    stub._add_prompts_to_generate.assert_called_once_with(8)
++    stub._add_prompts_to_generate.assert_called_once_with(8, global_steps=0)
+ 
+ 
+ def test_loaded_prompt_count_drives_on_train_begin_top_up(monkeypatch, tmp_path):
+@@ -133,4 +134,4 @@ def test_loaded_prompt_count_drives_on_train_begin_top_up(monkeypatch, tmp_path)
+     assert stub.global_steps == 6
+     assert stub._restored_tq_prompt_count == 6
+     load_tq_checkpoint.assert_called_once_with(str(tq_checkpoint_dir))
+-    stub._add_prompts_to_generate.assert_called_once_with(6)
++    stub._add_prompts_to_generate.assert_called_once_with(6, global_steps=5)
+diff --git a/tests/workers/test_chunked_topk_log_probs_on_cpu.py b/tests/workers/test_chunked_topk_log_probs_on_cpu.py
+index 1b556759..6dd3c7d3 100644
+--- a/tests/workers/test_chunked_topk_log_probs_on_cpu.py
++++ b/tests/workers/test_chunked_topk_log_probs_on_cpu.py
+@@ -97,7 +97,8 @@ def test_numerical_equivalence_low_precision_on_gpu(dtype, atol):
+     logits = torch.randn(B, T, V, dtype=dtype, device="cuda")
+     topk_ids = torch.randint(0, V, (B, T, K), device="cuda")
+ 
+-    ref = _reference_topk_log_probs(logits, topk_ids)
++    # output is fp32 now: compare with the fp32 reference (a bf16 reference rounds to ~0.06 at |lp|~12).
++    ref = _reference_topk_log_probs(logits.float(), topk_ids)
+     out = _chunked_topk_log_probs(logits, topk_ids, chunk_size=4096)
+ 
+     max_diff = (ref - out).abs().max().item()
+@@ -190,3 +191,82 @@ def test_gradient_flows_through_slice_assignment():
+     assert logits.grad is not None, "gradient should propagate to logits"
+     assert torch.isfinite(logits.grad).all(), "gradient should be finite"
+     assert (logits.grad.abs() > 0).any(), "gradient should be non-zero"
++
++
++# fp32 output + custom backward -----------------------------------------------------------------------------
++@pytest.mark.parametrize("dtype,atol", [(torch.float32, 1e-5), (torch.bfloat16, 3e-3)])
++@pytest.mark.parametrize("chunk_size", [3, 4096])
++def test_matches_float64_reference_with_repeated_ids(dtype, atol, chunk_size):
++    """Values and gradients match float64 log_softmax+gather; repeated ids accumulate in the gradient."""
++    torch.manual_seed(11)
++    B, T, V, K = 2, 5, 64, 6
++    base = torch.randn(B, T, V, dtype=dtype)
++    topk_ids = torch.randint(0, V, (B, T, K))
++    topk_ids[..., 1] = topk_ids[..., 0]  # repeated ids
++    w = torch.randn(B, T, K, dtype=torch.float64)
++
++    x = base.clone().requires_grad_(True)
++    out = _chunked_topk_log_probs(x, topk_ids, chunk_size=chunk_size)
++    assert out.dtype == torch.float32
++    (out.double() * w).sum().backward()
++
++    x_ref = base.double().requires_grad_(True)
++    ref = _reference_topk_log_probs(x_ref, topk_ids)
++    (ref * w).sum().backward()
++
++    assert (out.double() - ref).abs().max().item() <= atol
++    assert x.grad.dtype == dtype
++    assert (x.grad.double() - x_ref.grad).abs().max().item() <= (atol if dtype == torch.float32 else 2e-2)
++
++
++def test_masked_vocab_entries():
++    """-inf logits (masked vocab) at non-selected positions keep value and gradient finite and exact."""
++    torch.manual_seed(5)
++    B, T, V, K = 1, 4, 32, 3
++    base = torch.randn(B, T, V, dtype=torch.float64)
++    base[..., 16:] = float("-inf")
++    topk_ids = torch.randint(0, 16, (B, T, K))
++    x = base.float().requires_grad_(True)
++    out = _chunked_topk_log_probs(x, topk_ids, chunk_size=2)
++    out.sum().backward()
++    x_ref = base.clone().requires_grad_(True)
++    ref = _reference_topk_log_probs(x_ref, topk_ids)
++    ref.sum().backward()
++    assert torch.isfinite(out).all() and torch.isfinite(x.grad).all()
++    assert (out.double() - ref).abs().max().item() <= 1e-5
++    assert (x.grad.double() - x_ref.grad).abs().max().item() <= 1e-5
++
++
++def test_fully_masked_row_matches_reference():
++    """A fully -inf row gives the same (NaN) forward as log_softmax; other rows are unaffected."""
++    x = torch.randn(1, 2, 8)
++    x[0, 0] = float("-inf")
++    ids = torch.randint(0, 8, (1, 2, 2))
++    out = _chunked_topk_log_probs(x, ids, chunk_size=1)
++    ref = _reference_topk_log_probs(x, ids)
++    assert torch.allclose(out, ref, atol=1e-5, equal_nan=True)
++
++
++def _saved_numel(fn, *args):
++    saved = []
++
++    def pack(t):
++        saved.append(t.numel() * t.element_size())
++        return t
++
++    with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
++        fn(*args)
++    return sum(saved)
++
++
++def test_saved_memory_not_above_plain_path():
++    torch.manual_seed(1)
++    B, T, V, K = 2, 16, 512, 8
++    for dtype in (torch.float32, torch.bfloat16):
++        x = torch.randn(B, T, V, dtype=dtype, requires_grad=True)
++        ids = torch.randint(0, V, (B, T, K))
++        plain = _saved_numel(lambda a, i: torch.gather(F.log_softmax(a, dim=-1), -1, i), x, ids)
++        chunked = _saved_numel(lambda a, i: _chunked_topk_log_probs(a, i, chunk_size=4), x, ids)
++        assert chunked <= plain
++        # logits + ids + fp32 logZ only: no [N, V] fp32 copy in bf16.
++        assert chunked <= x.numel() * x.element_size() + ids.numel() * 8 + B * T * 4
+diff --git a/verl/experimental/agent_loop/agent_loop.py b/verl/experimental/agent_loop/agent_loop.py
+index d0e3038e..edeb6ea0 100644
+--- a/verl/experimental/agent_loop/agent_loop.py
++++ b/verl/experimental/agent_loop/agent_loop.py
+@@ -45,6 +45,7 @@ from pydantic import BaseModel, ConfigDict
+ from tensordict import TensorDict
+ from transformers import AutoProcessor, AutoTokenizer
+ 
++from verl.experimental.teacher_loop.teacher_manager import TeacherError
+ from verl.protocol import DataProto
+ from verl.tools.tool_registry import load_all_tools
+ from verl.trainer.distillation import is_distillation_enabled
+@@ -73,9 +74,34 @@ from verl.workers.rollout.llm_server import LLMServerClient
+ logger = logging.getLogger(__file__)
+ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+ 
++_TEACHER_ATTEMPTS = 4  # 1 call + 3 retries (2, 4, 8 s) for transient teacher errors
++
++
++async def _with_teacher_retry(call, attempts: int = _TEACHER_ATTEMPTS, base_delay_s: float = 2.0):
++    """Retry a teacher call on transient errors (replica restart, connection reset); deterministic errors
++    (length mismatch, routing key) and the last failure propagate and fail the run."""
++    for attempt in range(attempts):
++        try:
++            return await call()
++        except (TeacherError, AssertionError, ValueError, KeyError, TypeError):
++            raise
++        except Exception as e:
++            if attempt == attempts - 1:
++                raise
++            logger.warning(f"teacher call failed ({type(e).__name__}: {e}); retry {attempt + 1}")
++            await asyncio.sleep(base_delay_s * 2**attempt)
++
+ DEFAULT_ROUTING_CACHE_SIZE = 10000
+ 
+ 
++def _group_uid(sample_kwargs: Optional[dict[str, Any]]) -> Optional[str]:
++    """The prompt group uid of a sample (the trainer sets one `uid` per prompt before the n-fold repeat)."""
++    uid = (sample_kwargs or {}).get("uid")
++    if uid is None:
++        return None
++    uid = uid.item() if hasattr(uid, "item") else uid
++    return str(uid)
++
+ class AgentLoopMetrics(BaseModel):
+     """Agent loop performance metrics."""
+ 
+@@ -594,6 +620,10 @@ class AgentLoopWorker:
+             repetition_penalty=1.0,
+             logprobs=config.calculate_log_probs,
+         )
++        # presence penalty and stop ids come from the rollout config
++        sampling_params["presence_penalty"] = config.presence_penalty
++        if config.stop_token_ids:
++            sampling_params["stop_token_ids"] = list(config.stop_token_ids)
+ 
+         def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
+             params["top_p"] = 1.0
+@@ -605,6 +635,7 @@ class AgentLoopWorker:
+             sampling_params["top_p"] = config.val_kwargs.top_p
+             sampling_params["top_k"] = config.val_kwargs.top_k
+             sampling_params["temperature"] = config.val_kwargs.temperature
++            sampling_params["presence_penalty"] = config.val_kwargs.presence_penalty
+ 
+         # by default, we assume it's a single turn agent
+         if "agent_name" not in batch.non_tensor_batch:
+@@ -1044,15 +1075,26 @@ class AgentLoopWorker:
+                 if routing_value is not None:
+                     # Non-tensor batch values arrive as 0-d numpy objects / arrays; normalize to Python.
+                     routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
+-            teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
+-                sequence_ids=prompt_ids + response_ids,
+-                multi_modal_data=output.multi_modal_data,
+-                mm_processor_kwargs=output.mm_processor_kwargs,
+-                mm_processor_output=getattr(output, "mm_processor_output", None),
+-                routing_key=routing_key,
+-            )
+-            output.extra_fields["teacher_ids"] = teacher_ids
+-            output.extra_fields["teacher_logprobs"] = teacher_logprobs
++            try:
++                teacher_ids, teacher_logprobs = await _with_teacher_retry(
++                    lambda: self.teacher_server_manager.compute_teacher_logprobs_single(
++                        sequence_ids=prompt_ids + response_ids,
++                        multi_modal_data=output.multi_modal_data,
++                        mm_processor_kwargs=output.mm_processor_kwargs,
++                        mm_processor_output=getattr(output, "mm_processor_output", None),
++                        routing_key=routing_key,
++                        sticky_id=_group_uid(sample_kwargs),  # n samples of a prompt -> one teacher replica
++                    )
++                )
++                output.extra_fields["teacher_ids"] = teacher_ids
++                output.extra_fields["teacher_logprobs"] = teacher_logprobs
++                # record the resolved teacher so the trainer can log per-teacher routing counts
++                output.extra_fields["teacher_route"] = self.teacher_server_manager._resolve_teacher_key(routing_key)
++            except TeacherError:
++                raise
++            except Exception as e:
++                # teacher errors fail the run with the real message instead of dropping the sample
++                raise TeacherError(f"{type(e).__name__}: {e}") from e
+ 
+     def _postprocess(
+         self,
+diff --git a/verl/experimental/teacher_loop/teacher_manager.py b/verl/experimental/teacher_loop/teacher_manager.py
+index 7dacd64e..1089e514 100644
+--- a/verl/experimental/teacher_loop/teacher_manager.py
++++ b/verl/experimental/teacher_loop/teacher_manager.py
+@@ -32,6 +32,11 @@ logger = logging.getLogger(__file__)
+ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+ 
+ 
++class TeacherError(RuntimeError):
++    """A teacher-path failure (length mismatch, unknown routing key, server error). It must fail the run:
++    the async buffer would otherwise evict the sample as a rollout failure and silently replace it."""
++
++
+ def _get_teacher_sampling_params(
+     teacher_model_config: DistillationTeacherModelConfig,
+     distillation_loss_config: DistillationLossConfig,
+@@ -120,14 +125,19 @@ class AsyncTeacherLLMServerManager:
+         mm_processor_kwargs: Optional[dict[str, Any]] = None,
+         mm_processor_output: Optional[list[dict[str, Any]]] = None,
+         routing_key: Optional[str] = None,
++        sticky_id: Optional[str] = None,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+-        """Compute teacher log probabilities for a single unpadded sequence."""
++        """Compute teacher log probabilities for a single unpadded sequence.
++
++        sticky_id (the prompt group uid): the load balancer routes every request with the same id to the same
++        teacher replica, so the n samples of a prompt share its prefix cache (prompt + media). None = a fresh id per
++        sample (upstream). vLLM still gets a fresh request id per call (LLMServerClient._vllm_request_id)."""
+         multi_modal_data = multi_modal_data or {}
+         teacher_key = self._resolve_teacher_key(routing_key)
+         teacher_model_config = self.teacher_model_configs[teacher_key]
+         client = self.teacher_client[teacher_key]
+         teacher_output = await client.generate(
+-            request_id=uuid4().hex,
++            request_id=f"{teacher_key}:{sticky_id}" if sticky_id is not None else uuid4().hex,
+             prompt_ids=sequence_ids,
+             sampling_params=_get_teacher_sampling_params(teacher_model_config, self.distillation_loss_config),
+             image_data=multi_modal_data.get("images"),
+@@ -140,5 +150,12 @@ class AsyncTeacherLLMServerManager:
+         # the distillation loss settings.
+         teacher_ids = torch.tensor(teacher_output.extra_fields["prompt_ids"], dtype=torch.int32)
+         teacher_logprobs = torch.tensor(teacher_output.extra_fields["prompt_logprobs"])
+-        assert teacher_ids.shape[0] == teacher_logprobs.shape[0] == len(sequence_ids)
++        if not (teacher_ids.shape[0] == teacher_logprobs.shape[0] == len(sequence_ids)):
++            n_img = len(multi_modal_data.get("images") or [])
++            n_vid = len(multi_modal_data.get("videos") or [])
++            raise AssertionError(
++                f"teacher {teacher_key!r}: prompt_logprobs length {teacher_logprobs.shape[0]} (ids "
++                f"{teacher_ids.shape[0]}) != sequence length {len(sequence_ids)} "
++                f"(images={n_img}, videos={n_vid}, mm_processor_output={mm_processor_output is not None})"
++            )
+         return teacher_ids, teacher_logprobs
+diff --git a/verl/models/transformers/qwen3_5.py b/verl/models/transformers/qwen3_5.py
+index 0e2bb902..2e588057 100644
+--- a/verl/models/transformers/qwen3_5.py
++++ b/verl/models/transformers/qwen3_5.py
+@@ -23,6 +23,7 @@ import torch
+ import torch.distributed as dist
+ import torch.nn.functional as F
+ from torch.distributed.tensor import DTensor
++from torch.distributed.tensor.placement_types import Partial
+ from transformers.models.qwen3_5.modeling_qwen3_5 import (
+     Qwen3_5CausalLMOutputWithPast,
+     Qwen3_5ForConditionalGeneration,
+@@ -491,13 +492,18 @@ def _get_input_embeds(
+         video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+         inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+ 
+-    if pixel_values is None and pixel_values_videos is None:
++    # Run the vision tower exactly twice on every rank (image pass + video pass, dummy input for a
++    # missing modality). FSDP shards the vision blocks, so a rank whose micro-batch has images+videos and a
++    # rank with only one modality would issue different all-gather counts and deadlock.
++    n_missing = int(pixel_values is None) + int(pixel_values_videos is None)
++    if n_missing:
+         config = model.config.vision_config
+         patch_dim = config.in_channels * config.temporal_patch_size * config.patch_size**2
+-        pixel_values = torch.zeros((16, patch_dim), dtype=inputs_embeds.dtype, device=inputs_embeds.device)
+-        image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long, device=inputs_embeds.device)
+-        image_embeds = model.visual(pixel_values, grid_thw=image_grid_thw).pooler_output
+-        inputs_embeds = inputs_embeds + 0.0 * image_embeds.mean()
++        dummy_pixels = torch.zeros((16, patch_dim), dtype=model.visual.dtype, device=inputs_embeds.device)
++        dummy_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long, device=inputs_embeds.device)
++        for _ in range(n_missing):
++            dummy_embeds = model.visual(dummy_pixels, grid_thw=dummy_grid_thw).pooler_output
++            inputs_embeds = inputs_embeds + 0.0 * dummy_embeds.mean().to(inputs_embeds.dtype)
+ 
+     if attention_mask is not None:
+         attention_mask = attention_mask.to(inputs_embeds.device)
+@@ -586,7 +592,9 @@ def forward_with_torch_backend(
+     fused_linear_for_ppo = FusedLinearForPPO(impl_backend=getattr(self, "_verl_fused_kernels_backend", "torch"))
+     vocab_weights = self.lm_head.weight
+     if isinstance(vocab_weights, DTensor):
+-        vocab_weights = vocab_weights.full_tensor()
++        # FSDP2 CPUOffloadPolicy keeps the shard on CPU: move it before the gather (NCCL, grad flows back to CPU).
++        avg = [Partial("avg")] * vocab_weights.device_mesh.ndim  # one per mesh dim (HSDP: 2)
++        vocab_weights = vocab_weights.to(hidden_states.device).full_tensor(grad_placements=avg)
+ 
+     ulysses_sequence_parallel_size = get_ulysses_sequence_parallel_world_size()
+     if shift_labels is None and ulysses_sequence_parallel_size > 1:
+@@ -645,7 +653,9 @@ def forward_with_triton_backend(
+     vocab_weights = self.lm_head.weight
+     hidden_states = hidden_states.to(vocab_weights.dtype)
+     if isinstance(vocab_weights, DTensor):
+-        vocab_weights = vocab_weights.full_tensor()
++        # FSDP2 CPUOffloadPolicy keeps the shard on CPU: move it before the gather (NCCL, grad flows back to CPU).
++        avg = [Partial("avg")] * vocab_weights.device_mesh.ndim  # one per mesh dim (HSDP: 2)
++        vocab_weights = vocab_weights.to(hidden_states.device).full_tensor(grad_placements=avg)
+ 
+     log_probs, entropy = linear_cross_entropy(
+         hidden_states,
+diff --git a/verl/models/transformers/qwen3_vl.py b/verl/models/transformers/qwen3_vl.py
+index 4d1d10b4..1277b6dc 100644
+--- a/verl/models/transformers/qwen3_vl.py
++++ b/verl/models/transformers/qwen3_vl.py
+@@ -20,6 +20,7 @@ from typing import Optional
+ 
+ import torch
+ from torch.distributed.tensor import DTensor
++from torch.distributed.tensor.placement_types import Partial
+ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+     Qwen3VLCausalLMOutputWithPast,
+     Qwen3VLForConditionalGeneration,
+@@ -368,7 +369,8 @@ def forward_with_torch_backend(
+ 
+     vocab_weights = self.lm_head.weight
+     if isinstance(vocab_weights, DTensor):
+-        vocab_weights = vocab_weights.full_tensor().to(hidden_states.device)
++        avg = [Partial("avg")] * vocab_weights.device_mesh.ndim  # one per mesh dim (HSDP: 2)
++        vocab_weights = vocab_weights.full_tensor(grad_placements=avg).to(hidden_states.device)
+ 
+     fused_linear_for_ppo = FusedLinearForPPO(impl_backend=getattr(self, "_verl_fused_kernels_backend", "torch"))
+     log_probs, entropy = fused_linear_for_ppo.forward(
+diff --git a/verl/single_controller/ray/base.py b/verl/single_controller/ray/base.py
+index cfbc74d4..43645ef2 100644
+--- a/verl/single_controller/ray/base.py
++++ b/verl/single_controller/ray/base.py
+@@ -224,21 +224,25 @@ class ResourcePoolManager:
+         return sum([n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes])
+ 
+     def _check_resource_available(self):
+-        """Check if the resource pool can be satisfied in this ray cluster."""
+-        node_available_resources = ray._private.state.available_resources_per_node()
+-        node_available_gpus = {
+-            node: node_info.get("GPU", 0) if "GPU" in node_info else node_info.get("NPU", 0)
+-            for node, node_info in node_available_resources.items()
+-        }
+-
+-        # check total required gpus can be satisfied
+-        total_available_gpus = sum(node_available_gpus.values())
++        """Check if the resource pool can be satisfied in this ray cluster.
++
++        Uses cluster_resources() (total capacity) rather than
++        available_resources_per_node() (currently free). The available view
++        races during parallel rollout-replica init when the cluster is at
++        exact capacity: by the time replica N's check runs, replicas 0..N-1
++        have already claimed their PGs, leaving 0 free even though the
++        cluster has enough total room. Ray's placement_group + pg.ready()
++        path serializes the actual claims correctly, so the pre-flight only
++        needs to assert total capacity.
++        """
++        cluster_resources = ray.cluster_resources()
++        total_capacity_gpus = cluster_resources.get("GPU", 0) or cluster_resources.get("NPU", 0)
+         total_required_gpus = sum(
+             [n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes]
+         )
+-        if total_available_gpus < total_required_gpus:
++        if total_capacity_gpus < total_required_gpus:
+             raise ValueError(
+-                f"Total available GPUs {total_available_gpus} is less than total desired GPUs {total_required_gpus}"
++                f"Total cluster GPUs {total_capacity_gpus} is less than total desired GPUs {total_required_gpus}"
+             )
+ 
+ 
+diff --git a/verl/trainer/config/_generated_ppo_megatron_trainer.yaml b/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
+index bd912745..a662abf7 100644
+--- a/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
+@@ -312,6 +312,9 @@ actor_rollout_ref:
+     temperature: 1.0
+     top_k: -1
+     top_p: 1
++    presence_penalty: 0.0
++    stop_token_ids: null
++    mask_truncated_responses: false
+     full_determinism: false
+     seed: 42
+     prompt_length: ${oc.select:data.max_prompt_length,512}
+@@ -354,6 +357,7 @@ actor_rollout_ref:
+       top_p: 1.0
+       temperature: 0
+       'n': 1
++      presence_penalty: 0.0
+       do_sample: false
+     router_config_path: null
+     multi_turn:
+@@ -454,6 +458,7 @@ actor_rollout_ref:
+     use_shm: false
+     trust_remote_code: false
+     custom_chat_template: null
++    chat_template_file: null
+     external_lib: null
+     override_config: {}
+     enable_gradient_checkpointing: true
+@@ -546,6 +551,7 @@ data:
+   return_multi_modal_inputs: true
+   apply_chat_template_kwargs: {}
+   mm_processor_kwargs: {}
++  vision_defaults: {}
+ critic:
+   optim:
+     _target_: verl.workers.config.McoreOptimizerConfig
+@@ -716,6 +722,7 @@ critic:
+     use_shm: false
+     trust_remote_code: false
+     custom_chat_template: null
++    chat_template_file: null
+     external_lib: null
+     override_config: {}
+     enable_gradient_checkpointing: true
+diff --git a/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml b/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
+index c7f3a484..6ecc2831 100644
+--- a/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
+@@ -256,6 +256,9 @@ actor_rollout_ref:
+     temperature: 1.0
+     top_k: -1
+     top_p: 1
++    presence_penalty: 0.0
++    stop_token_ids: null
++    mask_truncated_responses: false
+     full_determinism: false
+     seed: 42
+     prompt_length: ${oc.select:data.max_prompt_length,512}
+@@ -298,6 +301,7 @@ actor_rollout_ref:
+       top_p: 1.0
+       temperature: 0
+       'n': 1
++      presence_penalty: 0.0
+       do_sample: false
+     router_config_path: null
+     multi_turn:
+@@ -398,6 +402,7 @@ actor_rollout_ref:
+     use_shm: false
+     trust_remote_code: false
+     custom_chat_template: null
++    chat_template_file: null
+     external_lib: null
+     override_config: {}
+     enable_gradient_checkpointing: true
+@@ -490,6 +495,7 @@ data:
+   return_multi_modal_inputs: true
+   apply_chat_template_kwargs: {}
+   mm_processor_kwargs: {}
++  vision_defaults: {}
+ critic:
+   optim:
+     _target_: verl.workers.config.TorchtitanOptimizerConfig
+@@ -611,6 +617,7 @@ critic:
+     use_shm: false
+     trust_remote_code: false
+     custom_chat_template: null
++    chat_template_file: null
+     external_lib: null
+     override_config: {}
+     enable_gradient_checkpointing: true
+diff --git a/verl/trainer/config/_generated_ppo_trainer.yaml b/verl/trainer/config/_generated_ppo_trainer.yaml
+index f7006d48..8267e2b2 100644
+--- a/verl/trainer/config/_generated_ppo_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_trainer.yaml
+@@ -297,6 +297,9 @@ actor_rollout_ref:
+     temperature: 1.0
+     top_k: -1
+     top_p: 1
++    presence_penalty: 0.0
++    stop_token_ids: null
++    mask_truncated_responses: false
+     full_determinism: false
+     seed: 42
+     prompt_length: ${oc.select:data.max_prompt_length,512}
+@@ -339,6 +342,7 @@ actor_rollout_ref:
+       top_p: 1.0
+       temperature: 0
+       'n': 1
++      presence_penalty: 0.0
+       do_sample: false
+     router_config_path: null
+     multi_turn:
+@@ -439,6 +443,7 @@ actor_rollout_ref:
+     use_shm: false
+     trust_remote_code: false
+     custom_chat_template: null
++    chat_template_file: null
+     external_lib: null
+     override_config: {}
+     enable_gradient_checkpointing: true
+@@ -531,6 +536,7 @@ data:
+   return_multi_modal_inputs: true
+   apply_chat_template_kwargs: {}
+   mm_processor_kwargs: {}
++  vision_defaults: {}
+ critic:
+   optim:
+     _target_: verl.workers.config.FSDPOptimizerConfig
+@@ -680,6 +686,7 @@ critic:
+     use_shm: false
+     trust_remote_code: false
+     custom_chat_template: null
++    chat_template_file: null
+     external_lib: null
+     override_config: {}
+     enable_gradient_checkpointing: true
+diff --git a/verl/trainer/config/_generated_ppo_veomni_trainer.yaml b/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
+index bdbd7e35..be2f87f7 100644
+--- a/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
+@@ -278,6 +278,9 @@ actor_rollout_ref:
+     temperature: 1.0
+     top_k: -1
+     top_p: 1
++    presence_penalty: 0.0
++    stop_token_ids: null
++    mask_truncated_responses: false
+     full_determinism: false
+     seed: 42
+     prompt_length: ${oc.select:data.max_prompt_length,512}
+@@ -320,6 +323,7 @@ actor_rollout_ref:
+       top_p: 1.0
+       temperature: 0
+       'n': 1
++      presence_penalty: 0.0
+       do_sample: false
+     router_config_path: null
+     multi_turn:
+@@ -420,6 +424,7 @@ actor_rollout_ref:
+     use_shm: false
+     trust_remote_code: false
+     custom_chat_template: null
++    chat_template_file: null
+     external_lib: null
+     override_config: {}
+     enable_gradient_checkpointing: true
+@@ -512,6 +517,7 @@ data:
+   return_multi_modal_inputs: true
+   apply_chat_template_kwargs: {}
+   mm_processor_kwargs: {}
++  vision_defaults: {}
+ critic:
+   optim:
+     _target_: verl.workers.config.VeOmniOptimizerConfig
+@@ -651,6 +657,7 @@ critic:
+     use_shm: false
+     trust_remote_code: false
+     custom_chat_template: null
++    chat_template_file: null
+     external_lib: null
+     override_config: {}
+     enable_gradient_checkpointing: true
+diff --git a/verl/trainer/config/data/legacy_data.yaml b/verl/trainer/config/data/legacy_data.yaml
+index 2971c6b5..d9dfd0c4 100644
+--- a/verl/trainer/config/data/legacy_data.yaml
++++ b/verl/trainer/config/data/legacy_data.yaml
+@@ -120,3 +120,6 @@ apply_chat_template_kwargs: {}
+ 
+ # Additional kwargs passed to multimodal processors/backends.
+ mm_processor_kwargs: {}
++
++# Per-modality defaults set on each image/video item, e.g. {image: {max_pixels: 1605632}, video: {nframes: 64}}.
++vision_defaults: {}
+diff --git a/verl/trainer/config/model/hf_model.yaml b/verl/trainer/config/model/hf_model.yaml
+index 6e8a2535..d3f1bba0 100644
+--- a/verl/trainer/config/model/hf_model.yaml
++++ b/verl/trainer/config/model/hf_model.yaml
+@@ -24,6 +24,9 @@ trust_remote_code: False
+ # custom chat template for the model
+ custom_chat_template: null
+ 
++# path of a jinja chat template file (set explicitly on processor and tokenizer; wins over custom_chat_template)
++chat_template_file: null
++
+ # whether to use external libs for the model
+ external_lib: null
+ 
+diff --git a/verl/trainer/config/rollout/rollout.yaml b/verl/trainer/config/rollout/rollout.yaml
+index 99ca1864..cc379b9f 100644
+--- a/verl/trainer/config/rollout/rollout.yaml
++++ b/verl/trainer/config/rollout/rollout.yaml
+@@ -22,6 +22,16 @@ top_k: -1
+ # Top-p sampling parameter. Default 1.0.
+ top_p: 1
+ 
++# Presence penalty sent with every request (training and validation).
++presence_penalty: 0.0
++
++# Extra stop token ids sent with every request. null = only the model generation_config eos ids.
++stop_token_ids: null
++
++# Zero the whole response_mask of truncated responses (no EOS at the length cap or max_model_len cut)
++# before the loss / batch_num_tokens / policy-gradient path sees it. V1 trainer only.
++mask_truncated_responses: false
++
+ # Whether to enable full determinism for reproducibility in rollout.
+ # See https://pytorch.org/docs/stable/notes/randomness.html for details.
+ full_determinism: false
+@@ -166,6 +176,9 @@ val_kwargs:
+   # whether to repeat n times for validation
+   n: 1
+ 
++  # presence penalty for validation
++  presence_penalty: 0.0
++
+   # Whether to sample during training rollout. False uses greedy sampling.
+   do_sample: False
+ 
+diff --git a/verl/trainer/distillation/fsdp/losses.py b/verl/trainer/distillation/fsdp/losses.py
+index 602d3875..7aded7ec 100644
+--- a/verl/trainer/distillation/fsdp/losses.py
++++ b/verl/trainer/distillation/fsdp/losses.py
+@@ -23,6 +23,42 @@ from verl.utils.ulysses import (
+ from verl.workers.config import DistillationConfig, DistillationLossConfig
+ 
+ 
++class _ChunkedTopkLogProbs(torch.autograd.Function):
++    """fp32 log_softmax(logits).gather(ids) in chunks; saves only logits, ids and fp32 logZ [N].
++
++    The plain `.float()` per chunk keeps an fp32 copy of every chunk for backward (2x the plain path in bf16).
++    Here backward recomputes the fp32 softmax per chunk from the saved logits.
++    """
++
++    @staticmethod
++    def forward(ctx, flat_logits, flat_topk, chunk_size):
++        N, K = flat_topk.shape
++        out = torch.empty((N, K), dtype=torch.float32, device=flat_logits.device)
++        log_z = torch.empty((N,), dtype=torch.float32, device=flat_logits.device)
++        for s in range(0, N, chunk_size):
++            e = min(s + chunk_size, N)
++            chunk = flat_logits[s:e].float()
++            log_z[s:e] = torch.logsumexp(chunk, dim=-1)
++            out[s:e] = torch.gather(chunk, dim=-1, index=flat_topk[s:e]) - log_z[s:e, None]
++        ctx.save_for_backward(flat_logits, flat_topk, log_z)
++        ctx.chunk_size = chunk_size
++        return out
++
++    @staticmethod
++    def backward(ctx, grad_out):
++        flat_logits, flat_topk, log_z = ctx.saved_tensors
++        N = flat_logits.shape[0]
++        grad_out = grad_out.float()
++        grad_logits = torch.empty_like(flat_logits)
++        for s in range(0, N, ctx.chunk_size):
++            e = min(s + ctx.chunk_size, N)
++            g = grad_out[s:e]
++            grad = torch.exp(flat_logits[s:e].float() - log_z[s:e, None]).neg_().mul_(g.sum(dim=-1, keepdim=True))
++            grad.scatter_add_(-1, flat_topk[s:e], g)
++            grad_logits[s:e] = grad.to(flat_logits.dtype)
++        return grad_logits, None, None
++
++
+ def _chunked_topk_log_probs(
+     logits: torch.Tensor,
+     topk_ids: torch.Tensor,
+@@ -33,7 +69,7 @@ def _chunked_topk_log_probs(
+     Uses the identity:
+         log_softmax(x).gather(idx) == x.gather(idx) - logsumexp(x, keepdim=True)
+     Streams the reduction in chunks of `chunk_size` tokens along (B*T) with fp32
+-    logsumexp for numerical stability.
++    logsumexp for numerical stability. custom autograd Function: fp32 output, no fp32 chunk copies saved.
+ 
+     Args:
+         logits:    [B, T, V] student logits.
+@@ -41,7 +77,7 @@ def _chunked_topk_log_probs(
+         chunk_size: number of tokens per chunk; only affects memory, not numerics.
+ 
+     Returns:
+-        [B, T, K] tensor with the same dtype as `logits`.
++        [B, T, K] float32 tensor.
+     """
+     B, T, V = logits.shape
+     K = topk_ids.shape[-1]
+@@ -51,16 +87,9 @@ def _chunked_topk_log_probs(
+ 
+     # Edge case: empty input (e.g. fully-padded micro-batch).
+     if N == 0:
+-        return torch.empty((B, T, K), dtype=logits.dtype, device=logits.device)
++        return torch.empty((B, T, K), dtype=torch.float32, device=logits.device)
+ 
+-    out = torch.empty((N, K), dtype=logits.dtype, device=logits.device)
+-    for s in range(0, N, chunk_size):
+-        e = min(s + chunk_size, N)
+-        chunk_logits_fp32 = flat_logits[s:e].float()
+-        log_z = torch.logsumexp(chunk_logits_fp32, dim=-1, keepdim=True)  # [c, 1]
+-        chunk_topk_logits = torch.gather(chunk_logits_fp32, dim=-1, index=flat_topk[s:e])
+-        out[s:e] = (chunk_topk_logits - log_z).to(logits.dtype)
+-    return out.reshape(B, T, K)
++    return _ChunkedTopkLogProbs.apply(flat_logits, flat_topk, chunk_size).reshape(B, T, K)
+ 
+ 
+ def kl_divergence(log_q: torch.Tensor, log_p: torch.Tensor) -> torch.Tensor:
+@@ -72,14 +101,50 @@ def kl_divergence(log_q: torch.Tensor, log_p: torch.Tensor) -> torch.Tensor:
+     return kld.sum(dim=-1)
+ 
+ 
++def clamp_min_straight_through(x: torch.Tensor, min_val: float) -> torch.Tensor:
++    """Forward value of x.clamp_min(min_val), gradient of x (identity) everywhere."""
++    return x + (x.clamp_min(min_val) - x).detach()
++
++
++def corrected_reverse_kl_divergence(log_q: torch.Tensor, log_p: torch.Tensor) -> torch.Tensor:
++    """Corrected reverse KL on a truncated support: sum q * (log q - log p) - q + p.
++
++    log_q = student, log_p = teacher, both over the teacher top-k ids. Each term is >= 0 and is 0 only at q == p, so
++    the optimum on the truncated support stays q == p (plain reverse KL on a support that does not sum to 1 does not).
++    Port of MMVistaReason training_integration/mopd/fsdp_loss.py (upstream verl PRs #7590 / #7806, not merged).
++    """
++    log_p = log_p.float()
++    log_q = log_q.float()
++    p = log_p.exp()
++    q = log_q.exp()
++    kld = q * (log_q - log_p) - q + p
++    return kld.sum(dim=-1)
++
++
++def compute_reverse_kl_topk_corrected(
++    student_logits: torch.Tensor,
++    teacher_topk_log_probs: torch.Tensor,
++    teacher_topk_ids: torch.Tensor,
++    config: DistillationConfig,
++    data_format: str,
++) -> dict[str, torch.Tensor]:
++    """loss_mode=reverse_kl_topk_corrected: compute_forward_kl_topk with the corrected reverse KL."""
++    return compute_forward_kl_topk(
++        student_logits, teacher_topk_log_probs, teacher_topk_ids, config, data_format,
++        divergence=corrected_reverse_kl_divergence,
++    )
++
++
+ def compute_forward_kl_topk(
+     student_logits: torch.Tensor,
+     teacher_topk_log_probs: torch.Tensor,
+     teacher_topk_ids: torch.Tensor,
+     config: DistillationConfig,
+     data_format: str,
++    divergence=None,
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+     """Compute forward KL distillation loss using top-k log probabilities.
++    divergence(log_q=student, log_p=teacher) replaces the forward KL (default kl_divergence).
+ 
+     Args:
+         student_logits: (bsz, seqlen/sp_size, vocab_size).
+@@ -125,9 +190,12 @@ def compute_forward_kl_topk(
+     student_mass = student_topk_log_probs.exp().sum(dim=-1)
+     teacher_mass = teacher_topk_log_probs.exp().sum(dim=-1)
+     if loss_config.log_prob_min_clamp is not None:
+-        student_topk_log_probs = student_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
++        # student side: straight-through clamp (clamped value, gradient of the unclamped log-prob). A plain
++        # clamp_min has zero gradient below the bound, so forward KL / JSD lose the -p pull on teacher-favoured tokens
++        # the student gives < e^min_clamp. Teacher side has no gradient: plain clamp.
++        student_topk_log_probs = clamp_min_straight_through(student_topk_log_probs, loss_config.log_prob_min_clamp)
+         teacher_topk_log_probs = teacher_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
+-    distillation_losses = kl_divergence(log_q=student_topk_log_probs, log_p=teacher_topk_log_probs)
++    distillation_losses = (divergence or kl_divergence)(log_q=student_topk_log_probs, log_p=teacher_topk_log_probs)
+ 
+     # Diagnostics for tracking teacher/student top-k overlap in OPD, following
+     # "Rethinking On-Policy Distillation of Large Language Models" (arXiv:2604.13016).
+diff --git a/verl/trainer/distillation/losses.py b/verl/trainer/distillation/losses.py
+index b939c585..88b4bc2f 100644
+--- a/verl/trainer/distillation/losses.py
++++ b/verl/trainer/distillation/losses.py
+@@ -114,6 +114,13 @@ def compute_distillation_loss_range(
+         distillation_losses_response = distillation_losses[response_mask.bool().to_padded_tensor(False)]
+     else:
+         distillation_losses_response = distillation_losses[response_mask.bool()]
++    if distillation_losses_response.numel() == 0:
++        # a micro-batch whose tokens are all masked (e.g. one truncated response) has no range; neutral values
++        # keep the per-rank Metric count equal (Metric.aggregate_dp requires it) and do not change min/max over ranks
++        return {
++            "distillation/loss_min": Metric(AggregationType.MIN, float("inf")),
++            "distillation/loss_max": Metric(AggregationType.MAX, float("-inf")),
++        }
+     return {
+         "distillation/loss_min": Metric(AggregationType.MIN, distillation_losses_response.min()),
+         "distillation/loss_max": Metric(AggregationType.MAX, distillation_losses_response.max()),
+@@ -139,10 +146,15 @@ def compute_topk_loss(
+         case "fsdp" | "veomni" | "fsdp2":
+             import verl.trainer.distillation.fsdp.losses as fsdp_losses
+ 
+-            distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
++            if distillation_config.distillation_loss.loss_mode == "reverse_kl_topk_corrected":
++                distillation_loss_fn = fsdp_losses.compute_reverse_kl_topk_corrected
++            else:
++                distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
+         case "megatron":
+             import verl.trainer.distillation.megatron.losses as megatron_losses
+ 
++            if distillation_config.distillation_loss.loss_mode == "reverse_kl_topk_corrected":
++                raise NotImplementedError("reverse_kl_topk_corrected is implemented for FSDP/VeOmni only")
+             distillation_loss_fn = megatron_losses.compute_forward_kl_topk
+         case _:
+             raise NotImplementedError(f"Unsupported strategy: {config.strategy=}")
+@@ -277,6 +289,9 @@ def distillation_loss(
+         if response_mask.is_nested:
+             response_mask = response_mask.to_padded_tensor(False)
+         rollout_is_weights = data.get("rollout_is_weights", None)
++        if rollout_is_weights is not None and rollout_is_weights.is_nested:
++            # same padding as ppo_loss: a jagged weight tensor cannot multiply the padded pg losses
++            rollout_is_weights = rollout_is_weights.to_padded_tensor(0.0)
+         distillation_loss, pg_metrics = policy_loss_fn(
+             old_log_prob=old_log_prob,
+             log_prob=log_prob,
+@@ -302,7 +317,9 @@ def distillation_loss(
+     return distillation_loss, distillation_metrics
+ 
+ 
+-@register_distillation_loss(DistillationLossSettings(names=["forward_kl_topk"], use_topk=True))  # type: ignore[arg-type]
++@register_distillation_loss(
++    DistillationLossSettings(names=["forward_kl_topk", "reverse_kl_topk_corrected"], use_topk=True)  # 2nd name
++)  # type: ignore[arg-type]
+ def compute_forward_kl_topk(
+     config: ActorConfig,
+     distillation_config: DistillationConfig,
+@@ -351,15 +368,26 @@ def compute_forward_kl_topk(
+     # Log amount of mass in the top-k log probabilities for both student and teacher.
+     student_mass = student_mass[response_mask_bool]
+     teacher_mass = teacher_mass[response_mask_bool]
+-    distillation_metrics = {
+-        "distillation/student_mass": student_mass.mean().item(),
+-        "distillation/student_mass_min": Metric(AggregationType.MIN, student_mass.min()),
+-        "distillation/student_mass_max": Metric(AggregationType.MAX, student_mass.max()),
+-        "distillation/teacher_mass": teacher_mass.mean().item(),
+-        "distillation/teacher_mass_min": Metric(AggregationType.MIN, teacher_mass.min()),
+-        "distillation/teacher_mass_max": Metric(AggregationType.MAX, teacher_mass.max()),
+-        **overlap_metrics,
+-    }
++    if student_mass.numel() == 0:
++        # every token of this micro-batch is masked (mask_truncated_responses): min()/max() of an empty
++        # tensor raise and mean() gives NaN. Plain-float means are skipped (verl concatenates them); Metric min/max get
++        # neutral values so every dp rank reports the same Metric count (Metric.aggregate_dp requires it).
++        distillation_metrics = {
++            "distillation/student_mass_min": Metric(AggregationType.MIN, float("inf")),
++            "distillation/student_mass_max": Metric(AggregationType.MAX, float("-inf")),
++            "distillation/teacher_mass_min": Metric(AggregationType.MIN, float("inf")),
++            "distillation/teacher_mass_max": Metric(AggregationType.MAX, float("-inf")),
++        }
++    else:
++        distillation_metrics = {
++            "distillation/student_mass": student_mass.mean().item(),
++            "distillation/student_mass_min": Metric(AggregationType.MIN, student_mass.min()),
++            "distillation/student_mass_max": Metric(AggregationType.MAX, student_mass.max()),
++            "distillation/teacher_mass": teacher_mass.mean().item(),
++            "distillation/teacher_mass_min": Metric(AggregationType.MIN, teacher_mass.min()),
++            "distillation/teacher_mass_max": Metric(AggregationType.MAX, teacher_mass.max()),
++            **overlap_metrics,
++        }
+ 
+     # Due to use of top-k, student and teacher distributions don't sum to 1 -> divergences can be negative.
+     distillation_losses = distillation_losses.clamp_min(0.0)
+diff --git a/verl/trainer/ppo/core_algos.py b/verl/trainer/ppo/core_algos.py
+index 9d08b846..935eba3e 100644
+--- a/verl/trainer/ppo/core_algos.py
++++ b/verl/trainer/ppo/core_algos.py
+@@ -1172,7 +1172,8 @@ def agg_loss(
+             if dp_size > 1:
+                 raise ValueError("(global) batch_num_tokens is required when dp_size > 1")
+             batch_num_tokens = loss_mask.sum()
+-        loss = verl_F.masked_sum(loss_mat, loss_mask) / batch_num_tokens * dp_size
++        # a fully masked global batch (e.g. every response truncated) has 0 tokens: loss 0, not NaN
++        loss = verl_F.masked_sum(loss_mat, loss_mask) / max(batch_num_tokens, 1) * dp_size
+     elif loss_agg_mode == "token-sum":
+         # DDP/FSDP average gradients across data-parallel ranks. Scaling each
+         # rank's local token sum by dp_size makes the reduced gradient equal to
+diff --git a/verl/trainer/ppo/metric_utils.py b/verl/trainer/ppo/metric_utils.py
+index 3de61d36..55b2f930 100644
+--- a/verl/trainer/ppo/metric_utils.py
++++ b/verl/trainer/ppo/metric_utils.py
+@@ -608,6 +608,76 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
+     return metrics
+ 
+ 
++def compute_per_source_train_metrics(
++    batch: DataProto,
++    data_sources: Any,
++    extra_fields: Any = None,
++    max_response_length: int | None = None,
++) -> dict[str, float]:
++    """Per-data_source training metrics (``training_ds/<ds>/*``) for batches that mix several domains.
++
++    CPU only, built from tensors already in the batch. Returns ``{}`` when ``data_sources`` is missing or does not
++    match the batch size. Keys, for every data_source present in the batch:
++        - n_samples, sample_share, token_share (share of the response tokens of the batch)
++        - score/mean: summed ``token_level_scores`` per sequence, non-aborted samples only (key absent if none)
++        - acc/mean: mean of ``extra_fields[i]["reward_extra_info"]["acc"]`` (key absent if no sample has it)
++        - response_length/mean, response_length/clip_ratio (share at ``max_response_length``, default the
++          padded response width)
++        - advantages/abs_mean: mean |advantage| over response tokens
++        - advantages/zero_frac: share of response tokens with advantage == 0
++    """
++    if data_sources is None:
++        return {}
++    sources = [str(d) if d is not None else "unknown" for d in data_sources]
++    n = len(sources)
++    if n == 0 or n != batch.batch["responses"].shape[0]:
++        return {}
++
++    sequence_score = batch.batch["token_level_scores"].sum(-1).float()
++    advantages = batch.batch["advantages"].float()
++    response_mask = batch.batch["response_mask"].bool()
++    response_length = _compute_response_info(batch)["response_length"].float()
++    cap = max_response_length if max_response_length else batch.batch["responses"].shape[-1]
++
++    abs_adv_sum = (advantages.abs() * response_mask).sum(-1)
++    zero_adv_count = ((advantages == 0) & response_mask).sum(-1).float()
++    n_tokens = response_mask.sum(-1).float()
++    total_response_tokens = max(response_length.sum().item(), 1.0)
++
++    acc = np.full(n, np.nan)
++    if extra_fields is not None:
++        for i, extra in enumerate(extra_fields):
++            extra = getattr(extra, "data", extra)  # NonTensorData wrapper
++            info = extra.get("reward_extra_info") if isinstance(extra, dict) else None
++            try:
++                acc[i] = float(info["acc"])
++            except (TypeError, KeyError, ValueError):
++                pass
++
++    metrics: dict[str, float] = {}
++    sources_arr = np.asarray(sources, dtype=object)
++    for source in dict.fromkeys(sources):
++        idx = torch.from_numpy(np.nonzero(sources_arr == source)[0])
++        pfx = f"training_ds/{source}"
++        length = response_length[idx]
++        tokens = n_tokens[idx].sum().item()
++        metrics[f"{pfx}/n_samples"] = len(idx)
++        metrics[f"{pfx}/sample_share"] = len(idx) / n
++        metrics[f"{pfx}/token_share"] = length.sum().item() / total_response_tokens
++        metrics[f"{pfx}/response_length/mean"] = length.mean().item()
++        metrics[f"{pfx}/response_length/clip_ratio"] = torch.eq(length, cap).float().mean().item()
++        non_aborted = length > 0
++        if non_aborted.any():
++            metrics[f"{pfx}/score/mean"] = sequence_score[idx][non_aborted].mean().item()
++        source_acc = acc[idx.numpy()]
++        if not np.isnan(source_acc).all():
++            metrics[f"{pfx}/acc/mean"] = float(np.nanmean(source_acc))
++        if tokens > 0:
++            metrics[f"{pfx}/advantages/abs_mean"] = abs_adv_sum[idx].sum().item() / tokens
++            metrics[f"{pfx}/advantages/zero_frac"] = zero_adv_count[idx].sum().item() / tokens
++    return metrics
++
++
+ def compute_timing_metrics(batch: DataProto, timing_raw: dict[str, float]) -> dict[str, Any]:
+     """
+     Computes timing metrics for different processing stages in PPO training.
+diff --git a/verl/trainer/ppo/v1/agent_loop_tq.py b/verl/trainer/ppo/v1/agent_loop_tq.py
+index 05f56043..1372e432 100644
+--- a/verl/trainer/ppo/v1/agent_loop_tq.py
++++ b/verl/trainer/ppo/v1/agent_loop_tq.py
+@@ -18,6 +18,7 @@
+ import asyncio
+ import logging
+ import os
++import time
+ from typing import Any
+ 
+ import ray
+@@ -31,6 +32,8 @@ from verl.experimental.agent_loop import (
+     AgentLoopWorker,
+     get_trajectory_info,
+ )
++from verl.experimental.teacher_loop.teacher_manager import TeacherError
++from verl.trainer.ppo.v1.truncation import apply_truncation_mask, collect_eos_ids, is_truncated_response
+ from verl.utils.ray_utils import auto_await
+ from verl.utils.tensordict_utils import list_of_dict_to_tensordict
+ 
+@@ -55,6 +58,22 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
+         super().__init__(*args, **kwargs)
+         tq.init()
+         self.background_tasks = set()
++        # truncation detection inputs (see verl/trainer/ppo/v1/truncation.py)
++        rollout_cfg = self.config.actor_rollout_ref.rollout
++        self._mask_truncated = bool(rollout_cfg.get("mask_truncated_responses", False))
++        self._eos_ids = collect_eos_ids(
++            self.tokenizer,
++            getattr(self.model_config, "generation_config", None),
++            rollout_cfg.get("stop_token_ids", None),
++        )
++        self._think_end_id = None
++        try:
++            tid = self.tokenizer.convert_tokens_to_ids("</think>")
++            unk = getattr(self.tokenizer, "unk_token_id", None)
++            if isinstance(tid, int) and tid >= 0 and tid != unk:
++                self._think_end_id = tid
++        except Exception:
++            pass
+ 
+     async def generate_sequences(self, batch: TensorDict) -> None:
+         """Spawn agent loop for each sample in the batch without waiting for the results."""
+@@ -68,12 +87,17 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
+             repetition_penalty=1.0,
+             logprobs=config.calculate_log_probs,
+         )
++        # presence penalty and stop ids come from the rollout config
++        sampling_params["presence_penalty"] = config.presence_penalty
++        if config.stop_token_ids:
++            sampling_params["stop_token_ids"] = list(config.stop_token_ids)
+ 
+         # override sampling params for validation
+         if validate:
+             sampling_params["top_p"] = config.val_kwargs.top_p
+             sampling_params["top_k"] = config.val_kwargs.top_k
+             sampling_params["temperature"] = config.val_kwargs.temperature
++            sampling_params["presence_penalty"] = config.val_kwargs.presence_penalty
+ 
+         # by default, we assume it's a single turn agent
+         if "agent_name" not in batch:
+@@ -107,7 +131,10 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
+     async def _run_prompt(self, prompt: dict, sampling_params: dict, trajectory: dict, trace: bool = False) -> None:
+         """Spawn multiple agent loops in parallel according to rollout.n or rollout.val_kwargs.n."""
+         uid, partition_id = prompt["uid"], "train" if not trajectory["validate"] else "val"
+-        await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "running"})
++        # wall-clock stamps feed the separate_async rollout activity metrics (v1/async_metrics.py)
++        await tq.async_kv_put(
++            key=uid, partition_id=partition_id, tag={"status": "running", "rollout_start_ts": time.time()}
++        )
+         tasks = []
+         try:
+             # NOTE: user can dynamically adjust n for each sample here, e.g according to task difficulty.
+@@ -140,12 +167,19 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
+                 status = "failure"
+             else:
+                 status = "finished"
+-            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": status})
++            tag = {"status": status, "rollout_end_ts": time.time()}
++            # a teacher error is fatal: the replay buffer raises it instead of evicting and replacing the group
++            teacher_errors = [e for e in session_errors if isinstance(e, TeacherError)]
++            if teacher_errors:
++                tag["fatal_error"] = f"teacher error for prompt uid={uid}: {teacher_errors[0]}"
++            await tq.async_kv_put(key=uid, partition_id=partition_id, tag=tag)
+         except Exception as e:
+             logger.exception(f"Error in _run_prompt: {e}")
+             if tasks:
+                 await _settle_session_tasks(tasks)
+-            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"})
++            await tq.async_kv_put(
++                key=uid, partition_id=partition_id, tag={"status": "failure", "rollout_end_ts": time.time()}
++            )
+ 
+     async def _agent_loop_postprocess(
+         self, output: AgentLoopOutput | list[AgentLoopOutput], validate, **kwargs
+@@ -195,6 +229,27 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
+             field.update(kwargs)
+             # do not store raw image/video
+             field.pop("multi_modal_data", None)
++            # flag truncated responses; with rollout.mask_truncated_responses zero the whole response_mask
++            # here, before anything (loss_mask, old/ref log-prob nesting, batch_num_tokens, advantages, loss)
++            # reads it. Lengths (responses, tags response_len) stay original so metrics still see truncation.
++            resp_list = output.response_ids
++            truncated = is_truncated_response(
++                resp_list,
++                self._eos_ids,
++                self.rollout_config.response_length,
++                finish_reason=(output.extra_fields or {}).get("finish_reason"),
++                prompt_len=len(output.prompt_ids),
++                max_model_len=getattr(self.rollout_config, "max_model_len", None),
++            )
++            masked = bool(self._mask_truncated and truncated)
++            if masked:
++                field["response_mask"] = torch.tensor(
++                    apply_truncation_mask(field["response_mask"].tolist(), truncated, True), dtype=torch.int64
++                )
++            field["extra_fields"]["truncated"] = truncated
++            field["extra_fields"]["truncation_masked"] = masked
++            if self._think_end_id is not None:
++                field["extra_fields"]["think_closed"] = self._think_end_id in resp_list
+             # TODO: uniform response_mask and loss_mask
+             field["loss_mask"] = field["response_mask"]
+             field["input_ids"] = input_ids
+diff --git a/verl/trainer/ppo/v1/async_metrics.py b/verl/trainer/ppo/v1/async_metrics.py
+new file mode 100644
+index 00000000..b1377b74
+--- /dev/null
++++ b/verl/trainer/ppo/v1/async_metrics.py
+@@ -0,0 +1,84 @@
++# Copyright 2026 The M3OPD-Reasoner Authors
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Rollout activity metrics for async (separate_async) training.
++
++The agent loop stamps each prompt group with ``rollout_start_ts`` / ``rollout_end_ts`` (wall clock, all n
++samples of the group). The replay buffer collects the stamps at every TransferQueue sync, and the trainer
++reduces them over the wall-clock window between two weight syncs.
++"""
++
++from collections.abc import Iterable
++
++
++def rollout_window_metrics(
++    groups: Iterable[tuple[float, float | None, int]],
++    window_start: float,
++    window_end: float,
++    n_rollout_gpus: int,
++    prefix: str = "separate_async/rollout",
++) -> dict[str, float]:
++    """Reduce prompt-group activity over ``[window_start, window_end]``.
++
++    Args:
++        groups: ``(start_ts, end_ts or None while running, response tokens of the group)``.
++        n_rollout_gpus: GPUs of the standalone rollout pool (throughput denominator).
++
++    Returns:
++        idle_ratio: share of the window with no group in flight.
++        inflight_groups_mean: time-averaged number of groups in flight.
++        groups_finished, group_latency_mean_s / max_s: groups whose end falls in the window.
++        gen_tokens_per_s_per_gpu: response tokens of the finished groups / window / rollout GPUs.
++    """
++    window = window_end - window_start
++    if window <= 0:
++        return {}
++
++    intervals = []
++    overlap_sum = 0.0
++    latencies = []
++    tokens = 0
++    for start, end, n_tokens in groups:
++        stop = window_end if end is None else end
++        lo, hi = max(start, window_start), min(stop, window_end)
++        if hi > lo:
++            intervals.append((lo, hi))
++            overlap_sum += hi - lo
++        if end is not None and window_start < end <= window_end:
++            latencies.append(end - start)
++            tokens += n_tokens
++
++    busy = 0.0
++    cur_lo = cur_hi = None
++    for lo, hi in sorted(intervals):
++        if cur_hi is None or lo > cur_hi:
++            if cur_hi is not None:
++                busy += cur_hi - cur_lo
++            cur_lo, cur_hi = lo, hi
++        else:
++            cur_hi = max(cur_hi, hi)
++    if cur_hi is not None:
++        busy += cur_hi - cur_lo
++
++    metrics = {
++        f"{prefix}/window_s": window,
++        f"{prefix}/idle_ratio": 1.0 - busy / window,
++        f"{prefix}/inflight_groups_mean": overlap_sum / window,
++        f"{prefix}/groups_finished": float(len(latencies)),
++    }
++    if latencies:
++        metrics[f"{prefix}/group_latency_mean_s"] = sum(latencies) / len(latencies)
++        metrics[f"{prefix}/group_latency_max_s"] = max(latencies)
++    if n_rollout_gpus > 0:
++        metrics[f"{prefix}/gen_tokens_per_s_per_gpu"] = tokens / window / n_rollout_gpus
++    return metrics
+diff --git a/verl/trainer/ppo/v1/replay_buffer.py b/verl/trainer/ppo/v1/replay_buffer.py
+index 08e05ec4..d43031b6 100644
+--- a/verl/trainer/ppo/v1/replay_buffer.py
++++ b/verl/trainer/ppo/v1/replay_buffer.py
+@@ -21,6 +21,7 @@ import transfer_queue as tq
+ from omegaconf import DictConfig
+ from transfer_queue import KVBatchMeta
+ 
++from verl.trainer.ppo.v1.async_metrics import rollout_window_metrics
+ from verl.utils.skip import SkipManager
+ 
+ logger = logging.getLogger(__name__)
+@@ -188,8 +189,12 @@ class ReplayBuffer:
+         self.failure_keys: dict[str, set] = defaultdict(set)
+         # partition_id => {prompt_key: global_steps}, used to prioritize older samples.
+         self.prompt_global_steps: dict[str, dict[str, int]] = defaultdict(dict)
++        # uid => {"start", "end", "tokens": {trajectory key: response_len}}, kept across syncs (cleared
++        # groups included) for the separate_async rollout activity metrics; pruned by rollout_activity().
++        self.rollout_groups: dict[str, dict] = {}
+         # Finished groups are immutable, so their DAPO classification can be reused across polling iterations.
+         self._dapo_classification_cache: dict[str, dict[str, float | None]] = defaultdict(dict)
++        self.lost_group_count: Counter = Counter()  # finished groups dropped because their TQ rows were lost
+ 
+     def _validate_mode_config(self) -> None:
+         if self.filter_groups_metric is not None:
+@@ -215,8 +220,12 @@ class ReplayBuffer:
+             partition = self.partitions[partition_id]
+             for key, tag in items.items():
+                 if tag.get("is_prompt", False):
++                    if tag.get("fatal_error"):
++                        # teacher errors fail the run (the group would otherwise be evicted and replaced)
++                        raise RuntimeError(tag["fatal_error"])
+                     # see: [GRPO group sampling control]
+                     self.prompt_global_steps[partition_id][key] = tag["global_steps"]
++                    self._record_rollout_group(key, tag)
+                     match tag["status"]:
+                         case "pending":
+                             self.pending_keys[partition_id].add(key)
+@@ -233,6 +242,35 @@ class ReplayBuffer:
+                     if key not in partition:
+                         partition[key] = {}
+                     partition[key].update(tag)
++                    group = self.rollout_groups.get(key.rsplit("_", 2)[0])
++                    if group is not None and tag.get("response_len") is not None:
++                        group["tokens"][key] = tag["response_len"]
++
++    def _record_rollout_group(self, uid: str, tag: dict) -> None:
++        """Keep the agent loop's wall-clock stamps of a prompt group (see v1/async_metrics.py)."""
++        start = tag.get("rollout_start_ts")
++        if start is None or tag["status"] == "pending":
++            return
++        group = self.rollout_groups.setdefault(uid, {"start": start, "end": None, "tokens": {}})
++        group["start"] = start
++        # A reissued group keeps its old end stamp in the merged tag until it finishes again.
++        group["end"] = tag.get("rollout_end_ts") if tag["status"] in ("finished", "failure") else None
++
++    def rollout_activity(self, window_start: float, window_end: float, n_rollout_gpus: int) -> dict[str, float]:
++        """Rollout activity metrics over a wall-clock window from the last synced stamps.
++
++        Groups that ended inside the window are dropped afterwards; a dropped group seen again at a later sync
++        ends before the next window, so it adds nothing there.
++        """
++        groups = [(g["start"], g["end"], sum(g["tokens"].values())) for g in self.rollout_groups.values()]
++        metrics = rollout_window_metrics(groups, window_start, window_end, n_rollout_gpus)
++        for uid in [u for u, g in self.rollout_groups.items() if g["end"] is not None and g["end"] <= window_end]:
++            del self.rollout_groups[uid]
++        return metrics
++
++    def inflight_count(self, partition_id: str) -> int:
++        """Pending + running prompt groups at the last sync."""
++        return len(self.pending_keys[partition_id]) + len(self.running_keys[partition_id])
+ 
+     @staticmethod
+     def _metrics_prefix(partition_id: str) -> str:
+@@ -258,6 +296,16 @@ class ReplayBuffer:
+             self.prompt_global_steps[partition_id].pop(uid, None)
+             self._dapo_classification_cache[partition_id].pop(uid, None)
+ 
++    def _read_keys_one_by_one(self, partition_id: str, keys: list[str], field: str) -> tuple[set[str], list]:
++        """Per-key fallback read: (uids with a missing row, [(key, value)] of the readable keys of the other uids)."""
++        lost_uids, values = set(), []
++        for key in keys:
++            try:
++                values.append((key, list(tq.kv_batch_get(keys=[key], partition_id=partition_id, select_fields=[field])[field])[0]))
++            except RuntimeError:
++                lost_uids.add(key.split("_")[0])
++        return lost_uids, [(key, value) for key, value in values if key.split("_")[0] not in lost_uids]
++
+     def _dapo_filtered_keys(self, partition_id: str) -> tuple[set[str], Counter]:
+         """Finished groups whose configured DAPO metric is identical across all trajectories.
+ 
+@@ -279,13 +327,27 @@ class ReplayBuffer:
+         metrics_by_uid: dict[str, list[float]] = defaultdict(list)
+         missing_metric_uids = new_finished_uids - {key.split("_")[0] for key in trajectory_keys}
+ 
++        field = "rm_scores" if use_canonical_reward else "extra_fields"
+         if trajectory_keys:
+-            data = tq.kv_batch_get(
+-                keys=trajectory_keys,
+-                partition_id=partition_id,
+-                select_fields=["rm_scores"] if use_canonical_reward else ["extra_fields"],
+-            )
+-            metric_data = list(data["rm_scores"] if use_canonical_reward else data["extra_fields"])
++            try:
++                data = tq.kv_batch_get(keys=trajectory_keys, partition_id=partition_id, select_fields=[field])
++                metric_data = list(data[field])
++            except RuntimeError as e:
++                # kv_clear frees global indexes in the controller before the storage rows are deleted; a
++                # concurrent put can reuse a freed index and lose its rows ("key N not found in field ..."). Read
++                # key by key and drop the groups whose rows are gone instead of failing the run.
++                lost_uids, kept = self._read_keys_one_by_one(partition_id, trajectory_keys, field)
++                logger.warning(
++                    "DAPO metric batch read failed (%s); dropping %d finished group(s) with lost TQ rows",
++                    str(e)[:200],
++                    len(lost_uids),
++                )
++                self.lost_group_count[partition_id] += len(lost_uids)
++                self._clear_groups(partition_id, lost_uids)
++                new_finished_uids -= lost_uids
++                missing_metric_uids -= lost_uids
++                trajectory_keys = [key for key, _ in kept]
++                metric_data = [value for _, value in kept]
+         else:
+             metric_data = []
+ 
+@@ -314,6 +376,36 @@ class ReplayBuffer:
+         filtered_rewards = {uid: reward for uid, reward in classification_cache.items() if reward is not None}
+         return set(filtered_rewards), Counter(filtered_rewards.values())
+ 
++    def _dapo_evicted_by_source(self, partition_id: str, dapo_uids: set[str]) -> dict[str, int]:
++        """Per-data_source counts of DAPO-evicted groups, split by the value their trajectories share.
++
++        Keys: ``training_ds/<ds>/filter_groups/evicted_all_high`` (shared metric value > 0: all correct for ``acc``)
++        and ``.../evicted_all_low`` (shared value <= 0: all wrong); ``training_ds`` is ``validation_ds`` for a
++        non-train partition, like the other filter_groups metrics. Must run before the groups are cleared, while
++        the classification cache and trajectory keys exist. Metrics only: returns ``{}`` when data_source is missing.
++        """
++        try:
++            cache = self._dapo_classification_cache[partition_id]
++            key_by_uid: dict[str, str] = {}
++            for key in self.partitions[partition_id]:
++                key_by_uid.setdefault(key.split("_")[0], key)
++            uids = [uid for uid in dapo_uids if uid in key_by_uid and cache.get(uid) is not None]
++            if not uids:
++                return {}
++            data = tq.kv_batch_get(
++                keys=[key_by_uid[uid] for uid in uids], partition_id=partition_id, select_fields=["data_source"]
++            )
++            sources = data["data_source"]
++            sources = sources.tolist() if hasattr(sources, "tolist") else list(sources)
++            counts: Counter = Counter()
++            for uid, source in zip(uids, sources, strict=True):
++                level = "high" if cache[uid] > 0 else "low"
++                counts[f"{self._metrics_prefix(partition_id)}_ds/{source}/filter_groups/evicted_all_{level}"] += 1
++            return dict(counts)
++        except Exception as e:  # metrics must never stop training; data_source may be missing from the rows
++            logger.warning(f"per-data_source DAPO eviction metrics skipped: {type(e).__name__}: {e}")
++            return {}
++
+     def _terminal_eviction_reasons(
+         self, global_steps: int, partition_id: str
+     ) -> tuple[set[str], set[str], set[str], Counter]:
+@@ -372,6 +464,7 @@ class ReplayBuffer:
+             )
+         if dapo_uids:
+             metrics[f"{prefix}/filter_groups/evicted_samples"] = len(dapo_uids)
++            metrics.update(self._dapo_evicted_by_source(partition_id, dapo_uids))
+             # Non-scalar diagnostic: how many filtered (no-signal) groups collapsed to each metric value.
+             metrics[DAPO_FILTERED_REWARD_COUNTS_KEY] = dict(dapo_counts)
+         if failed_uids:
+diff --git a/verl/trainer/ppo/v1/trainer_base.py b/verl/trainer/ppo/v1/trainer_base.py
+index f14720fa..e819ddb6 100644
+--- a/verl/trainer/ppo/v1/trainer_base.py
++++ b/verl/trainer/ppo/v1/trainer_base.py
+@@ -12,6 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import copy
+ import json
+ import logging
+ import math
+@@ -39,6 +40,7 @@ from transfer_queue import KVBatchMeta
+ from verl.checkpoint_engine import CheckpointEngineManager
+ from verl.experimental.agent_loop import AgentLoopManager
+ from verl.experimental.reward_loop import RewardLoopManager
++from verl.trainer.ppo.v1.truncation import domain_rollout_metrics
+ from verl.experimental.teacher_loop import MultiTeacherModelManager
+ from verl.protocol import DataProto, DataProtoFuture
+ from verl.single_controller.ray import (
+@@ -55,6 +57,7 @@ from verl.trainer.ppo.metric_utils import (
+     RolloutMoELoadBalanceMetricsAccumulator,
+     compute_data_metrics,
+     compute_moe_lb_metrics,
++    compute_per_source_train_metrics,
+     compute_throughout_metrics,
+     compute_timing_metrics,
+     compute_variance_proxy_metrics,
+@@ -149,6 +152,11 @@ class PPOTrainer(ABC):
+         # track mini-batch index within a parameter_sync_step cycle for Decoupled PPO
+         self.local_trigger_step = 0
+         self._restored_tq_prompt_count = 0
++        # dataloader state before each fetch, keyed by prompts fetched so far: lets a checkpoint record the
++        # position of the last TRAINED prompt when the TQ buffer (prefetched, untrained prompts) cannot be saved.
++        self._dl_snapshots: dict[int, dict] = {}
++        self._dl_fetched = 0
++        self._dl_base_step = 0
+ 
+     def _build_replay_buffer(self) -> ReplayBuffer:
+         """Instantiate the replay buffer (or a user-provided custom sampler).
+@@ -466,6 +474,7 @@ class PPOTrainer(ABC):
+ 
+         # we start from step 1
+         self.global_steps += 1
++        self._dl_base_step = self.global_steps - 1
+         SkipManager.set_step(self.global_steps)
+         self._reissue_inflight_prompts()
+         self.prev_step_profile = False
+@@ -658,7 +667,9 @@ class PPOTrainer(ABC):
+             )
+             return
+ 
+-        self._add_prompts_to_generate(missing_prompts)
++        # Tag warmup prompts one step older than the current step: the `wait` staleness rule then holds step
++        # s until they finish, instead of training the first-finished (short) half of 2 batches of equal tag.
++        self._add_prompts_to_generate(missing_prompts, global_steps=self.global_steps - 1)
+         logger.info(
+             f"Added {missing_prompts} warmup prompts after restoring {restored_prompts} of "
+             f"{target_prompts} target prompt groups"
+@@ -1010,7 +1021,7 @@ class PPOTrainer(ABC):
+         # save dataloader state
+         local_mkdir_safe(local_global_step_folder)
+         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
+-        torch.save(self.train_dataloader.state_dict(), dataloader_local_path)
++        torch.save(self._dataloader_state_for_save(), dataloader_local_path)
+ 
+         # save TransferQueue state for async modes so in-flight prompts (already fetched from the
+         # dataloader but not yet trained into this checkpoint's weights) survive a restart:
+@@ -1478,8 +1489,29 @@ class PPOTrainer(ABC):
+                 seen.add(id(self.critic_wg))
+                 self.critic_wg.stop_profile(run_command=run_command)
+ 
++    def _dataloader_state_for_save(self) -> dict:
++        """Dataloader state to checkpoint.
++
++        With a TQ release that saves the buffer, the current position is right (in-flight prompts are restored).
++        Otherwise the prefetched, untrained prompts would be lost on resume, so save the position right after the
++        prompts trained so far (``global_steps - base`` steps of ``train_batch_size``): a resume re-yields the rest.
++        """
++        if self.trainer_mode == "sync" or _tq_supports_checkpoint():
++            return self.train_dataloader.state_dict()
++        trained = (self.global_steps - self._dl_base_step) * self.config.data.train_batch_size
++        keys = [k for k in self._dl_snapshots if k <= trained]
++        if not keys:
++            logger.warning("No dataloader snapshot at or before the trained prompts; saving the current position")
++            return self.train_dataloader.state_dict()
++        if max(keys) != trained:
++            logger.warning(f"No dataloader snapshot at {trained} trained prompts; using {max(keys)}")
++        return self._dl_snapshots[max(keys)]
++
+     def _fetch_one_gen_batch(self) -> TensorDict:
+         """Fetch one ``gen_batch_size`` chunk from the dataloader."""
++        keep_from = (self.global_steps - 1 - self._dl_base_step) * self.config.data.train_batch_size
++        self._dl_snapshots = {k: v for k, v in self._dl_snapshots.items() if k >= keep_from}
++        self._dl_snapshots[self._dl_fetched] = copy.deepcopy(self.train_dataloader.state_dict())
+         try:
+             if self.train_dataloader_it is None:
+                 self.train_dataloader_it = iter(self.train_dataloader)
+@@ -1489,10 +1521,11 @@ class PPOTrainer(ABC):
+             batch_dict = next(self.train_dataloader_it)
+ 
+         batch_dict["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object)
++        self._dl_fetched += len(batch_dict["uid"])
+         return tu.get_tensordict(batch_dict)
+ 
+-    def _next_train_batch(self, num_prompts: int | None = None) -> TensorDict:
+-        """Fetch and coalesce the requested number of prompts."""
++    def _next_train_batch(self, num_prompts: int | None = None, global_steps: int | None = None) -> TensorDict:
++        """Fetch and coalesce the requested number of prompts (tagged ``global_steps``, default the current step)."""
+         train_batch_size = self.config.data.train_batch_size
+         if num_prompts is None:
+             num_prompts = train_batch_size
+@@ -1505,12 +1538,13 @@ class PPOTrainer(ABC):
+ 
+         chunks = [self._fetch_one_gen_batch() for _ in range(num_prompts // gen_batch_size)]
+         batch = chunks[0] if len(chunks) == 1 else tu.concat_tensordict(chunks)
+-        tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
++        tu.assign_non_tensor_data(batch, "global_steps", self.global_steps if global_steps is None else global_steps)
+         return batch
+ 
+-    def _submit_batch_to_rollout(self, batch: TensorDict) -> int:
++    def _submit_batch_to_rollout(self, batch: TensorDict, global_steps: int | None = None) -> int:
+         """Register prompts in TransferQueue and dispatch them for generation."""
+-        tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in range(len(batch))]
++        global_steps = self.global_steps if global_steps is None else global_steps
++        tags = [{"is_prompt": True, "status": "pending", "global_steps": global_steps} for _ in range(len(batch))]
+         if self.trainer_mode != "sync":
+             tq.kv_batch_put(
+                 keys=list(batch["uid"]),
+@@ -1526,10 +1560,10 @@ class PPOTrainer(ABC):
+         self.agent_loop_manager.generate_sequences(batch)
+         return len(batch)
+ 
+-    def _add_prompts_to_generate(self, num_prompts: int) -> int:
++    def _add_prompts_to_generate(self, num_prompts: int, global_steps: int | None = None) -> int:
+         """Add an exact number of prompts to the AgentLoopManager."""
+-        batch = self._next_train_batch(num_prompts)
+-        return self._submit_batch_to_rollout(batch)
++        batch = self._next_train_batch(num_prompts, global_steps=global_steps)
++        return self._submit_batch_to_rollout(batch, global_steps=global_steps)
+ 
+     @SkipManager.annotate_tq(role="rollout_tq", phase="submit")
+     def _add_batch_to_generate(self):
+@@ -1880,7 +1914,150 @@ class PPOTrainer(ABC):
+ 
+         return batch
+ 
++    def _distill_route_metrics(self, keys, partition_id, non_padding_mask) -> dict:
++        """Per-teacher routing counts and per-domain k1 distillation loss for the train batch.
++
++        distillation/route/<key>/n_domain: rows whose routing column (distillation.teacher_key) == key
++        distillation/route/<key>/n_teacher: rows the agent loop actually sent to teacher <key>
++        distillation/route/mismatch: rows whose teacher differs from their routing value (must be 0)
++        distillation/route/<key>/k1_mean, k1_clamped_mean: token mean of log pi_old - log pi_T over the
++        response (the per-token distillation loss before / after loss_max_clamp), n_tokens: its token count.
++        Top-k teacher logprobs (topk loss modes): log pi_T of the sampled token is known only when the token is in the
++        teacher top-k, so k1 is over those tokens, and per teacher also
++        topk_cover: share of sampled tokens inside the teacher top-k; top1_agree: share equal to the teacher argmax;
++        topk_mass: mean teacher probability mass in its top-k.
++        """
++        try:
++            dcfg = self.config.distillation
++            route_col = dcfg.get("teacher_key", "data_source")
++            clamp = dcfg.distillation_loss.get("loss_max_clamp", None)
++            fields = [route_col, "extra_fields", "teacher_logprobs", "teacher_ids", "old_log_probs", "response_mask",
++                      "responses"]
++            data = tq.kv_batch_get(keys=keys, partition_id=partition_id, select_fields=fields)
++            mask_np = non_padding_mask if non_padding_mask.any() else np.ones(len(keys), dtype=bool)
++            def _as_list(v):  # non-tensor fields come back as ndarray, NonTensorStack or tensordict LinkedList
++                return v.tolist() if hasattr(v, "tolist") else list(v)
++
++            domains = [str(v) for v in _as_list(data[route_col])]
++            routes = [e.get("teacher_route") if isinstance(e, dict) else None for e in _as_list(data["extra_fields"])]
++            tlp = data["teacher_logprobs"].unbind()
++            tid = data["teacher_ids"].unbind()
++            resp = data["responses"].unbind()
++            olp = data["old_log_probs"].unbind()
++            rmask = data["response_mask"].unbind()
++            out: dict = {}
++            sums: dict = defaultdict(lambda: [0.0, 0.0, 0])
++            topk_sums: dict = defaultdict(lambda: [0, 0, 0.0, 0])  # in top-k, == argmax, mass sum, response tokens
++            mismatch = 0
++            for i in range(len(keys)):
++                if not mask_np[i]:
++                    continue
++                d, r = domains[i], routes[i]
++                out[f"distillation/route/{d}/n_domain"] = out.get(f"distillation/route/{d}/n_domain", 0) + 1
++                rk = str(r) if r is not None else "none"
++                out[f"distillation/route/{rk}/n_teacher"] = out.get(f"distillation/route/{rk}/n_teacher", 0) + 1
++                if r is None or (str(r) != d and str(r) != "default"):
++                    mismatch += 1
++                m = rmask[i].bool()
++                n_resp = m.shape[0]
++                full = tlp[i].reshape(tlp[i].shape[0], -1)
++                if full.shape[-1] == 1:
++                    lp = full[-n_resp:].float()
++                    t = lp[:, 0]
++                else:  # top-k: find the sampled token among the teacher top-k ids
++                    # top-k rows are next-token aligned like the student logits (row j = distribution of token
++                    # j+1, last row = padding): response token t sits at row P+t-1, i.e. rows [-(n+1):-1]
++                    lp = full[-(n_resp + 1):-1].float()
++                    ids = tid[i].reshape(tid[i].shape[0], -1)[-(n_resp + 1):-1]
++                    hit = ids == resp[i][:n_resp].reshape(-1, 1).to(ids.dtype)
++                    inside = hit.any(-1)
++                    t = torch.where(inside, (lp * hit).sum(-1), torch.zeros_like(lp[:, 0]))
++                    tk = topk_sums[rk]
++                    tk[0] += int((inside & m).sum().item())
++                    tk[1] += int((hit[:, 0] & m).sum().item())
++                    tk[2] += lp.exp().sum(-1)[m].sum().item()
++                    tk[3] += int(m.sum().item())
++                    m = m & inside
++                k1 = (olp[i].float() - t)[m]
++                acc = sums[rk]
++                acc[0] += k1.sum().item()
++                acc[1] += (k1.clamp(-clamp, clamp) if clamp is not None else k1).sum().item()
++                acc[2] += int(m.sum().item())
++            for rk, (s_raw, s_clamp, n) in sums.items():
++                out[f"distillation/route/{rk}/k1_mean"] = s_raw / max(n, 1)
++                out[f"distillation/route/{rk}/k1_clamped_mean"] = s_clamp / max(n, 1)
++                out[f"distillation/route/{rk}/n_tokens"] = n
++            for rk, (n_in, n_top1, mass, n) in topk_sums.items():
++                out[f"distillation/route/{rk}/topk_cover"] = n_in / max(n, 1)
++                out[f"distillation/route/{rk}/top1_agree"] = n_top1 / max(n, 1)
++                out[f"distillation/route/{rk}/topk_mass"] = mass / max(n, 1)
++            out["distillation/route/mismatch"] = mismatch
++            return out
++        except Exception as e:  # metrics must never stop training
++            logger.warning(f"distillation route metrics failed: {type(e).__name__}: {e}")
++            return {}
++
++    def _rollout_domain_metrics(self, batch: KVBatchMeta, non_padding_mask) -> dict:
++        """Per-data_source rollout metrics (mopd_domain/<ds>/*) and truncation metrics (mopd_trunc/*).
++
++        Lengths come from the tags (original response_len), so response_mask zeroing never hides truncation.
++        """
++        def _as_list(v):  # non-tensor fields come back as ndarray, NonTensorStack or tensordict LinkedList
++            return v.tolist() if hasattr(v, "tolist") else list(v)
++
++        try:
++            sel = np.nonzero(non_padding_mask)[0] if non_padding_mask.any() else np.arange(len(batch.keys))
++            sel_keys = [batch.keys[i] for i in sel]
++            try:
++                data = tq.kv_batch_get(
++                    keys=sel_keys, partition_id=batch.partition_id, select_fields=["data_source", "extra_fields"]
++                )
++                domains = [str(v) for v in _as_list(data["data_source"])]
++            except Exception:  # data_source missing from the batch
++                data = tq.kv_batch_get(keys=sel_keys, partition_id=batch.partition_id, select_fields=["extra_fields"])
++                domains = ["unknown"] * len(sel)
++            extras = [e if isinstance(e, dict) else {} for e in _as_list(data["extra_fields"])]
++            lens = [batch.tags[i].get("response_len", 0) for i in sel]
++            out = domain_rollout_metrics(
++                domains,
++                lens,
++                [bool(e.get("truncated", False)) for e in extras],
++                [bool(e.get("truncation_masked", False)) for e in extras],
++                [e.get("think_closed") for e in extras],
++            )
++            if out.get("mopd_trunc/all_masked_batch"):
++                logger.warning("every sample in the train batch is masked as truncated: loss is zero this step")
++            return out
++        except Exception as e:  # metrics must never stop training
++            logger.warning(f"rollout domain metrics failed: {type(e).__name__}: {e}")
++            return {}
++
++    def _per_source_train_metrics(self, batch: KVBatchMeta, non_padding_mask, metrics_batch: DataProto) -> dict:
++        """Per-data_source training metrics (training_ds/<ds>/*); skipped when data_source is missing."""
++
++        def _as_list(v):  # non-tensor fields come back as ndarray, NonTensorStack or tensordict LinkedList
++            return v.tolist() if hasattr(v, "tolist") else list(v)
++
++        try:
++            sel = np.nonzero(non_padding_mask)[0] if non_padding_mask.any() else np.arange(len(batch.keys))
++            data = tq.kv_batch_get(
++                keys=[batch.keys[i] for i in sel],
++                partition_id=batch.partition_id,
++                select_fields=["data_source", "extra_fields"],
++            )
++            return compute_per_source_train_metrics(
++                metrics_batch,
++                _as_list(data["data_source"]),
++                _as_list(data["extra_fields"]),
++                max_response_length=self.config.actor_rollout_ref.rollout.response_length,
++            )
++        except Exception as e:  # metrics must never stop training; data_source may be missing from the batch
++            logger.warning(f"per-data_source train metrics skipped: {type(e).__name__}: {e}")
++            return {}
++
+     def _compute_metrics(self, batch: KVBatchMeta, metrics, timing_raw, global_steps, epoch):
++        keys, partition_id = batch.keys, batch.partition_id
++        kv_batch = batch  # `batch` becomes a DataProto below; the domain metrics need the KVBatchMeta
+         # 1. collect necessary fields from TransferQueue for computing metrics
+         non_padding_mask = np.array([not tag.get("is_padding", False) for tag in batch.tags], dtype=bool)
+         fields = [
+@@ -1957,6 +2134,10 @@ class PPOTrainer(ABC):
+             )
+         )
+         metrics.update(compute_data_metrics(batch=metrics_batch, use_critic=self.use_critic))
++        metrics.update(self._rollout_domain_metrics(kv_batch, non_padding_mask))
++        metrics.update(self._per_source_train_metrics(kv_batch, non_padding_mask, metrics_batch))
++        if self.use_teacher_policy:
++            metrics.update(self._distill_route_metrics(keys, partition_id, non_padding_mask))
+         metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+         n_gpus = self._get_n_gpus_for_throughput()
+         metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+diff --git a/verl/trainer/ppo/v1/trainer_separate_async.py b/verl/trainer/ppo/v1/trainer_separate_async.py
+index 44ffc402..0d5dcf35 100644
+--- a/verl/trainer/ppo/v1/trainer_separate_async.py
++++ b/verl/trainer/ppo/v1/trainer_separate_async.py
+@@ -180,8 +180,7 @@ class PPOTrainerSeparateAsync(PPOTrainer):
+             self.current_mode = HybridEngineMode.TRAINER
+             logger.info(
+                 "[V1SepAsync] hybrid replicas disabled (actor_rollout_ref.hybrid_engine=False): "
+-                f"rollout served by {len(self.standalone_server_manager.get_replicas())} standalone replicas only",
+-                flush=True,
++                f"rollout served by {len(self.standalone_server_manager.get_replicas())} standalone replicas only"
+             )
+ 
+     def _compute_old_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+@@ -229,6 +228,7 @@ class PPOTrainerSeparateAsync(PPOTrainer):
+ 
+     def on_train_begin(self):
+         self._add_async_warmup_batches(self.config.trainer.v1.separate_async.num_warmup_batches)
++        self._activity_window_start = time.time()
+ 
+     def on_validate_begin(self):
+         if self.current_mode == HybridEngineMode.TRAINER:
+@@ -239,8 +239,12 @@ class PPOTrainerSeparateAsync(PPOTrainer):
+         self._step_sample_wait_seconds = 0.0
+         self._step_wait_samples = 0
+         self._step_threshold = 0
++        # trainer wait / buffer depth / rollout activity, logged every step (not only with enable_switch)
++        self._step_wall_start = time.time()
+         if self.hybrid_rollout_config.enable_switch:
+             self.timing_raw["switch_wait"] = 0.0
++        if self.current_mode != HybridEngineMode.ROLLOUT or not self.hybrid_rollout_config.enable_switch:
++            self._step_start_buffer_metrics = self._buffer_metrics("step_start", self.global_steps)
+         if self.current_mode != HybridEngineMode.ROLLOUT:
+             return
+         if not self.hybrid_rollout_config.enable_switch:
+@@ -249,6 +253,7 @@ class PPOTrainerSeparateAsync(PPOTrainer):
+ 
+         self._step_threshold = self._switch_threshold()
+         sampleable_count = self.replay_buffer.get_sampleable_count(self.global_steps, "train")
++        self._step_start_buffer_metrics = self._buffer_metrics("step_start", self.global_steps, sampleable_count)
+         if sampleable_count >= self._step_threshold:
+             self._timed_switch_to_trainer()
+ 
+@@ -392,6 +397,46 @@ class PPOTrainerSeparateAsync(PPOTrainer):
+                     self.switch_to_rollout(already_registered=True)
+                 self._to_rollout_costs.append(prepare_seconds + time.perf_counter() - switch_start)
+ 
++        self._pending_sync_metrics.update(self._async_activity_metrics())
++
++    def _buffer_metrics(self, when: str, global_steps: int, ready: int | None = None) -> dict[str, float]:
++        """Ready (sampleable) and in-flight prompt groups; the count call also syncs the stamps.
++
++        ``ready`` reuses a count the caller just took (one TransferQueue listing per decision point).
++        """
++        replay_buffer = getattr(self, "replay_buffer", None)
++        if ready is None:
++            if not hasattr(replay_buffer, "get_sampleable_count"):
++                return {}
++            ready = replay_buffer.get_sampleable_count(global_steps, "train")
++        metrics = {f"separate_async/buffer/ready_groups_{when}": float(ready)}
++        if hasattr(replay_buffer, "inflight_count"):
++            metrics[f"separate_async/buffer/inflight_groups_{when}"] = float(replay_buffer.inflight_count("train"))
++        return metrics
++
++    def _async_activity_metrics(self) -> dict[str, float]:
++        """Trainer idle share of the step, buffer depth, and rollout activity since the last weight sync.
++
++        Trainer-bound: trainer idle_ratio ~0, rollout idle_ratio high, ready groups >= train_batch_size.
++        Rollout-bound: trainer idle_ratio high, ready_groups_step_start ~0, rollout idle_ratio ~0.
++        """
++        now = time.time()
++        metrics = dict(getattr(self, "_step_start_buffer_metrics", {}))
++        step_wall = now - getattr(self, "_step_wall_start", now)
++        wait_s = getattr(self, "_step_sample_wait_seconds", 0.0)
++        metrics["separate_async/trainer/wait_s"] = wait_s
++        if step_wall > 0:
++            metrics["separate_async/trainer/idle_ratio"] = wait_s / step_wall
++        metrics.update(self._buffer_metrics("step_end", self.global_steps + 1))
++        window_start = getattr(self, "_activity_window_start", None)
++        if hasattr(getattr(self, "replay_buffer", None), "rollout_activity") and window_start is not None:
++            rollout = self.config.actor_rollout_ref.rollout
++            metrics.update(
++                self.replay_buffer.rollout_activity(window_start, now, rollout.n_gpus_per_node * rollout.nnodes)
++            )
++        self._activity_window_start = now
++        return metrics
++
+     def _get_n_gpus_for_throughput(self) -> int:
+         """Include standalone rollout GPUs in the throughput denominator."""
+         trainer_gpus = self.resource_pool_manager.get_n_gpus()
+diff --git a/verl/trainer/ppo/v1/truncation.py b/verl/trainer/ppo/v1/truncation.py
+new file mode 100644
+index 00000000..9666f9ee
+--- /dev/null
++++ b/verl/trainer/ppo/v1/truncation.py
+@@ -0,0 +1,118 @@
++# Copyright 2026 The M3OPD-Reasoner Authors
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Truncated-response detection, masking and per-domain rollout metrics (pure python, CPU)."""
++
++from collections import defaultdict
++from typing import Iterable, Optional, Sequence
++
++import numpy as np
++
++
++def collect_eos_ids(tokenizer=None, generation_config=None, extra_ids: Optional[Iterable[int]] = None) -> set[int]:
++    """Union of tokenizer eos id, generation_config eos id(s) and extra stop token ids."""
++    ids: set[int] = set()
++
++    def _add(v):
++        if v is None:
++            return
++        # any non-string iterable: list/tuple/set, numpy arrays, OmegaConf ListConfig (stop_token_ids from the config)
++        if isinstance(v, Iterable) and not isinstance(v, (str, bytes)):
++            for x in v:
++                _add(x)
++        else:
++            ids.add(int(v))
++
++    _add(getattr(tokenizer, "eos_token_id", None))
++    _add(getattr(generation_config, "eos_token_id", None))
++    _add(extra_ids)
++    return ids
++
++
++def is_truncated_response(
++    response_ids: Sequence[int],
++    eos_ids: set[int],
++    response_cap: int,
++    finish_reason: Optional[str] = None,
++    prompt_len: int = 0,
++    max_model_len: Optional[int] = None,
++) -> bool:
++    """True when generation stopped without an EOS as the last token because of a length limit.
++
++    Length limit = backend finish reason "length", or valid response length >= response_cap, or
++    prompt_len + response length >= max_model_len (agent loop / engine cut at the context limit).
++    """
++    n = len(response_ids)
++    if n > 0 and int(response_ids[-1]) in eos_ids:
++        return False
++    hit_len = finish_reason == "length" or n >= response_cap
++    if max_model_len is not None and prompt_len + n >= max_model_len:
++        hit_len = True
++    return bool(hit_len)
++
++
++def apply_truncation_mask(response_mask: Sequence[int], truncated: bool, enabled: bool) -> list[int]:
++    """Whole-sample mask: all zeros when enabled and truncated, else the original mask. Length is kept."""
++    if enabled and truncated:
++        return [0] * len(response_mask)
++    return list(response_mask)
++
++
++def domain_rollout_metrics(
++    domains: Sequence,
++    response_lens: Sequence[int],
++    truncated: Sequence[bool],
++    masked: Sequence[bool],
++    think_closed: Optional[Sequence[Optional[bool]]] = None,
++) -> dict:
++    """Overall ``mopd_trunc/*`` and per data_source ``mopd_domain/<ds>/*`` rollout metrics.
++
++    response_lens are the ORIGINAL response lengths (not the masked count). A missing / None domain is
++    "unknown". think_closed entries may be None (token id unknown): that metric is then skipped.
++    """
++    n = len(response_lens)
++    out: dict = {}
++    if n == 0:
++        return out
++    lens = np.asarray(response_lens, dtype=np.float64)
++    trunc = np.asarray(truncated, dtype=bool)
++    msk = np.asarray(masked, dtype=bool)
++    doms = [str(d) if d is not None else "unknown" for d in domains]
++    total_tok = max(lens.sum(), 1.0)
++
++    out["mopd_trunc/frac_truncated"] = float(trunc.mean())
++    out["mopd_trunc/frac_masked"] = float(msk.mean())
++    out["mopd_trunc/masked_token_frac"] = float(lens[msk].sum() / total_tok)
++    # 1.0 when no sample keeps a loss token: the loss is zero (never NaN) but the step is a no-op.
++    out["mopd_trunc/all_masked_batch"] = float(bool(msk.all()))
++
++    idx_by_dom: dict = defaultdict(list)
++    for i, d in enumerate(doms):
++        idx_by_dom[d].append(i)
++    for d, idx in idx_by_dom.items():
++        ix = np.asarray(idx)
++        dl = lens[ix]
++        pfx = f"mopd_domain/{d}"
++        out[f"{pfx}/n"] = len(idx)
++        out[f"{pfx}/token_share"] = float(dl.sum() / total_tok)
++        out[f"{pfx}/resp_len_mean"] = float(dl.mean())
++        out[f"{pfx}/resp_len_p90"] = float(np.percentile(dl, 90))
++        out[f"{pfx}/resp_len_max"] = float(dl.max())
++        out[f"{pfx}/trunc_rate"] = float(trunc[ix].mean())
++        out[f"{pfx}/masked_frac"] = float(msk[ix].mean())
++        out[f"{pfx}/masked_token_frac"] = float(dl[msk[ix]].sum() / max(dl.sum(), 1.0))
++        if think_closed is not None:
++            vals = [think_closed[i] for i in idx if think_closed[i] is not None]
++            if vals:
++                out[f"{pfx}/think_close_rate"] = float(np.mean(vals))
++    return out
+diff --git a/verl/trainer/ppo/v1/utils.py b/verl/trainer/ppo/v1/utils.py
+index e9dec313..cecf0a0e 100644
+--- a/verl/trainer/ppo/v1/utils.py
++++ b/verl/trainer/ppo/v1/utils.py
+@@ -86,6 +86,9 @@ class MetricsAggregator:
+             if metric_name in metric_list:
+                 return agg_type
+ 
++        if metric_name.startswith("training_ds/") and "/filter_groups/" in metric_name:
++            return "sum"  # per-data_source eviction counts; the data_source name must not hit the keyword rules
++
+         metric_lower = metric_name.lower()
+         if metric_lower.endswith("/lr") or metric_lower.endswith("_lr") or metric_lower == "lr":
+             return "last"
+diff --git a/verl/utils/dataset/rl_dataset.py b/verl/utils/dataset/rl_dataset.py
+index aad0655b..fa0ea0ef 100644
+--- a/verl/utils/dataset/rl_dataset.py
++++ b/verl/utils/dataset/rl_dataset.py
+@@ -119,6 +119,16 @@ class RLHFDataset(Dataset):
+         self.filter_overlong_prompts = config.get("filter_overlong_prompts", True)
+         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
+         self.mm_processor_kwargs = config.get("mm_processor_kwargs", {})
++        # Per-modality defaults merged (setdefault) into every image/video content item,
++        # e.g. {image: {max_pixels: ...}, video: {nframes: 64, max_pixels: ...}}. qwen_vl_utils reads
++        # these keys from the item, so one YAML block fixes pixels/frames for rollout and length filter.
++        # Values already on the item (from the parquet) win. Empty = upstream behaviour.
++        vision_defaults = config.get("vision_defaults", None) or {}
++        if not isinstance(vision_defaults, dict):
++            from omegaconf import OmegaConf
++
++            vision_defaults = OmegaConf.to_container(vision_defaults, resolve=True)
++        self.vision_defaults = {k: dict(v or {}) for k, v in vision_defaults.items() if k in ("image", "video")}
+ 
+         # Mirror AgentLoopWorker's tool loading so length filtering sees the
+         # same schemas the rollout will.
+@@ -337,8 +347,11 @@ class RLHFDataset(Dataset):
+                         image = image.convert("RGB")
+                         content_list.append({"type": "image", "image": image})
+                     elif isinstance(image, dict):
++                        # parquet {image, bytes} structs carry None for the unused field; bytes are decoded
++                        # once here and dropped from the item (a second copy would be pickled to every rollout worker)
++                        image = {k: v for k, v in image.items() if v is not None}
+                         if "bytes" in image:
+-                            image["image"] = Image.open(BytesIO(image["bytes"]))
++                            image["image"] = Image.open(BytesIO(image.pop("bytes")))
+                         content_list.append({"type": "image", **image})
+                     elif isinstance(image, str | os.PathLike):
+                         content_list.append({"type": "image", "image": os.fspath(image)})
+@@ -381,8 +394,27 @@ class RLHFDataset(Dataset):
+         assert image_offset == len(images), f"image_offset {image_offset} != len(images) {len(images)}"
+         assert video_offset == len(videos), f"video_offset {video_offset} != len(videos) {len(videos)}"
+         assert audio_offset == len(audios), f"audio_offset {audio_offset} != len(audios) {len(audios)}"
++        self._apply_vision_defaults(messages)
+         return messages
+ 
++    def _apply_vision_defaults(self, messages: list):
++        """setdefault `data.vision_defaults[image|video]` keys on each structured media item."""
++        defaults = getattr(self, "vision_defaults", None)
++        if not defaults:
++            return
++        for message in messages:
++            content = message.get("content") if isinstance(message, dict) else None
++            if not isinstance(content, list):
++                continue
++            for item in content:
++                if isinstance(item, dict) and item.get("type") in defaults:
++                    # qwen_vl_utils accepts either fps or nframes: an item that sets one keeps both unset.
++                    sampling_set = "fps" in item or "nframes" in item
++                    for key, value in defaults[item["type"]].items():
++                        if sampling_set and key in ("fps", "nframes"):
++                            continue
++                        item.setdefault(key, value)
++
+     def __getitem__(self, item):
+         """For rollout, apply_chat_template has been moved to AgentLoop, so we only return raw_prompt here."""
+         row_dict: dict = self.dataframe[item]
+@@ -455,6 +487,9 @@ class RLHFDataset(Dataset):
+             None,
+             lambda: process_vision_info(messages, image_patch_size=image_patch_size, return_video_metadata=True),
+         )
++        from verl.utils.dataset.vision_utils import check_video_reader
++
++        check_video_reader(videos)
+         return images, videos
+ 
+     @classmethod
+@@ -493,6 +528,9 @@ class RLHFDataset(Dataset):
+             images, videos = process_vision_info(
+                 messages, image_patch_size=image_patch_size, return_video_metadata=True
+             )
++            from verl.utils.dataset.vision_utils import check_video_reader
++
++            check_video_reader(videos)
+         else:
+             images, videos = None, None
+         audios = cls._extract_audio_info(messages)
+@@ -505,11 +543,10 @@ class RLHFDataset(Dataset):
+         image_patch_size,
+         config: DictConfig,
+     ) -> tuple[list[Image.Image], list[Any], list[Any]]:
+-        loop = asyncio.get_running_loop()
+-        return await loop.run_in_executor(
+-            None,
+-            lambda: cls._process_multi_modal_info(messages, image_patch_size=image_patch_size, config=config),
+-        )
++        # thread cap + single-flight decode cache (VERL_VIDEO_DECODE_*; default = upstream executor path).
++        from verl.utils.dataset.video_decode_cache import decode_multi_modal_info
++
++        return await decode_multi_modal_info(messages, image_patch_size, config, cls._process_multi_modal_info)
+ 
+     def split(self, num_splits: int):
+         """
+diff --git a/verl/utils/dataset/video_decode_cache.py b/verl/utils/dataset/video_decode_cache.py
+new file mode 100644
+index 00000000..b5e84287
+--- /dev/null
++++ b/verl/utils/dataset/video_decode_cache.py
+@@ -0,0 +1,193 @@
++# Copyright 2026 The M3OPD-Reasoner Authors
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Video-decode throughput fixes for the AgentLoop rollout path.
++
++Decoding is over-threaded: each decode uses every torch thread on the node for a short burst, so
++concurrent decodes oversubscribe the CPU. The rollout path also repeats a batch by `rollout.n`
++before decode, so the same video file is decoded once per rollout. This module adds an optional
++thread cap and an optional single-flight cache of decoded videos. With no env vars set,
++`decode_multi_modal_info` is exactly the upstream v0.9.1 `process_multi_modal_info`.
++
++Cap threads BEFORE enabling the executor: offloading decodes that each want many threads
++multiplies the over-subscription instead of fixing it.
++
++Env vars:
++  VERL_VIDEO_DECODE_THREADS   int, 0 = leave torch threading alone. 1 is the recommended cap.
++  VERL_VIDEO_DECODE_CACHE     int, 0 = disabled. Entries in the decoded-video cache.
++                              Decoded entries can be large, so size it deliberately.
++  VERL_VIDEO_DECODE_EXECUTOR  "1" (default) to run decode in the default thread pool instead of
++                              inline on the event loop.
++"""
++
++import asyncio
++import hashlib
++import json
++import logging
++import os
++
++logger = logging.getLogger(__file__)
++logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
++
++
++def _int_env(name: str, default: int = 0) -> int:
++    try:
++        return int(os.getenv(name, str(default)))
++    except (TypeError, ValueError):
++        return default
++
++
++DECODE_THREADS = _int_env("VERL_VIDEO_DECODE_THREADS", 0)
++DECODE_CACHE_SIZE = _int_env("VERL_VIDEO_DECODE_CACHE", 0)
++DECODE_USE_EXECUTOR = os.getenv("VERL_VIDEO_DECODE_EXECUTOR", "1") == "1"
++
++_thread_cap_applied = False
++
++
++def _apply_thread_cap() -> None:
++    """Cap torch intra-op threads once per process.
++
++    Set at runtime rather than via OMP_NUM_THREADS because the env var is read
++    when the OpenMP runtime initialises, which has already happened by the time a
++    Ray actor starts. torch.set_num_threads takes effect immediately and covers
++    the resize/float conversion that dominates decode CPU.
++    """
++    global _thread_cap_applied
++    if _thread_cap_applied or DECODE_THREADS <= 0:
++        return
++    try:
++        import torch
++
++        torch.set_num_threads(DECODE_THREADS)
++        logger.warning("[video-decode] torch.set_num_threads(%d)", DECODE_THREADS)
++    except Exception as e:  # pragma: no cover - never let a perf knob kill a run
++        logger.warning("[video-decode] could not cap threads: %s", e)
++    _thread_cap_applied = True
++
++
++# key -> decoded result;  key -> in-flight future (single-flight)
++_cache: "dict[str, tuple]" = {}
++_cache_order: "list[str]" = []
++_inflight: "dict[str, asyncio.Future]" = {}
++_lock: "asyncio.Lock | None" = None
++
++_stats = {"hit": 0, "miss": 0}
++
++
++def _get_lock() -> asyncio.Lock:
++    global _lock
++    if _lock is None:
++        _lock = asyncio.Lock()
++    return _lock
++
++
++def _cache_key(messages) -> "str | None":
++    """Stable key over the media items, or None when the row must not be cached.
++
++    Returns None if any IMAGE item is present. `_process_multi_modal_info`
++    MUTATES image dicts (`item.setdefault("max_pixels", ...)`) and those same
++    message objects are later fed to apply_chat_template, so serving a cached
++    decode would skip a mutation that changes the prompt. Video rows have no such
++    mutation, and this corpus is video-only, so the cache still applies to it.
++    """
++    parts = []
++    for message in messages:
++        content = message.get("content")
++        if not isinstance(content, list):
++            continue
++        for item in content:
++            if not isinstance(item, dict):
++                continue
++            kind = item.get("type")
++            if kind == "image":
++                return None
++            if kind == "video":
++                payload = {k: v for k, v in item.items() if k != "type"}
++                parts.append(json.dumps(payload, sort_keys=True, default=str))
++    if not parts:
++        return None
++    return hashlib.sha1("|".join(parts).encode()).hexdigest()
++
++
++async def _run_raw(raw_fn, messages, image_patch_size, config):
++    if DECODE_USE_EXECUTOR:
++        loop = asyncio.get_running_loop()
++        return await loop.run_in_executor(
++            None, lambda: raw_fn(messages, image_patch_size=image_patch_size, config=config)
++        )
++    return raw_fn(messages, image_patch_size=image_patch_size, config=config)
++
++
++async def decode_multi_modal_info(messages, image_patch_size, config, raw_fn):
++    """Drop-in for RLHFDataset.process_multi_modal_info.
++
++    With every env var unset this is exactly `raw_fn(...)` in the default executor (upstream v0.9.1).
++    """
++    _apply_thread_cap()
++
++    if DECODE_CACHE_SIZE <= 0:
++        return await _run_raw(raw_fn, messages, image_patch_size, config)
++
++    key = _cache_key(messages)
++    if key is None:
++        return await _run_raw(raw_fn, messages, image_patch_size, config)
++
++    lock = _get_lock()
++    async with lock:
++        if key in _cache:
++            _stats["hit"] += 1
++            return _cache[key]
++        future = _inflight.get(key)
++        owner = future is None
++        if owner:
++            future = asyncio.get_running_loop().create_future()
++            _inflight[key] = future
++            _stats["miss"] += 1
++
++    # A non-owner waits on the owner's decode instead of starting its own. This
++    # is what actually removes the n-fold duplication: the n rollouts of a prompt
++    # are dispatched concurrently (agent_loop.py:658), so a plain
++    # check-then-decode cache would miss n times before the first result lands.
++    if not owner:
++        return await future
++
++    try:
++        result = await _run_raw(raw_fn, messages, image_patch_size, config)
++    except BaseException as e:
++        async with lock:
++            _inflight.pop(key, None)
++        if not future.done():
++            future.set_exception(e)
++        # Nobody may be awaiting this future; consume it so asyncio stays quiet.
++        future.exception()
++        raise
++
++    async with lock:
++        _cache[key] = result
++        _cache_order.append(key)
++        while len(_cache_order) > DECODE_CACHE_SIZE:
++            _cache.pop(_cache_order.pop(0), None)
++        _inflight.pop(key, None)
++    if not future.done():
++        future.set_result(result)
++    return result
++
++
++def decode_stats() -> dict:
++    total = _stats["hit"] + _stats["miss"]
++    return {
++        "hit": _stats["hit"],
++        "miss": _stats["miss"],
++        "hit_rate": (_stats["hit"] / total) if total else 0.0,
++        "cached": len(_cache),
++    }
+diff --git a/verl/utils/dataset/vision_utils.py b/verl/utils/dataset/vision_utils.py
+index c3fa1d5d..04cae944 100644
+--- a/verl/utils/dataset/vision_utils.py
++++ b/verl/utils/dataset/vision_utils.py
+@@ -129,3 +129,24 @@ def process_multi_modal_inputs_for_minicpmo(input_ids, attention_mask, position_
+     multi_modal_inputs["attention_mask"] = attention_mask
+     multi_modal_inputs["position_ids"] = position_ids
+     return {"data": multi_modal_inputs}
++
++
++def check_video_reader(videos) -> None:
++    """qwen_vl_utils falls back to torchvision when the forced reader (FORCE_QWENVL_VIDEO_READER = the configured
++    video reader) fails, which changes the frames silently. `videos` = process_vision_info output with
++    return_video_metadata=True. Raise (default) or warn (MOPD_VIDEO_READER_CHECK=warn)."""
++    import logging
++    import os
++
++    want = os.environ.get("FORCE_QWENVL_VIDEO_READER")
++    if not want:
++        return
++    for _frames, meta in videos or []:
++        got = (meta or {}).get("video_backend")
++        if got is None or got == want:
++            continue
++        msg = f"video decoded with {got!r}, configured reader is {want!r} (qwen_vl_utils fell back)"
++        if os.environ.get("MOPD_VIDEO_READER_CHECK", "raise") == "warn":
++            logging.getLogger(__name__).warning(msg)
++            continue
++        raise RuntimeError(msg)
+diff --git a/verl/workers/config/distillation.py b/verl/workers/config/distillation.py
+index b58f8bcc..1782c558 100644
+--- a/verl/workers/config/distillation.py
++++ b/verl/workers/config/distillation.py
+@@ -109,7 +109,7 @@ class DistillationLossConfig(BaseConfig):
+                 f"but got {self.policy_loss_mode}."
+             )
+ 
+-        if self.use_policy_gradient and self.loss_mode == "forward_kl_topk":
++        if self.use_policy_gradient and self.loss_mode in ("forward_kl_topk", "reverse_kl_topk_corrected"):
+             print(
+                 "WARNING: forward_kl_topk is most effective as a supervised distillation loss "
+                 "(use_policy_gradient=False). With policy gradient, the update uses only the sampled"
+diff --git a/verl/workers/config/model.py b/verl/workers/config/model.py
+index 545ec468..8b45fd62 100644
+--- a/verl/workers/config/model.py
++++ b/verl/workers/config/model.py
+@@ -109,6 +109,8 @@ class HFModelConfig(BaseConfig):
+ 
+     # custom chat template for the model
+     custom_chat_template: Optional[str] = None
++    # path of a jinja chat template file; its text becomes custom_chat_template (set on processor AND tokenizer)
++    chat_template_file: Optional[str] = None
+ 
+     external_lib: Any = None
+ 
+@@ -170,11 +172,16 @@ class HFModelConfig(BaseConfig):
+         ):
+             self.processor.chat_template = self.tokenizer.chat_template
+ 
+-        if self.custom_chat_template is not None:
++        chat_template = self.custom_chat_template
++        if self.chat_template_file:
++            # explicit template (the Base processor ships none); the file wins over a template string
++            with open(self.chat_template_file) as f:
++                chat_template = f.read()
++        if chat_template is not None:
+             if self.processor is not None:
+-                self.processor.chat_template = self.custom_chat_template
+-            else:
+-                self.tokenizer.chat_template = self.custom_chat_template
++                self.processor.chat_template = chat_template
++            if self.tokenizer is not None:
++                self.tokenizer.chat_template = chat_template
+ 
+         self.local_hf_config_path = copy_to_local(self.hf_config_path, use_shm=self.use_shm)
+         self.generation_config = get_generation_config(
+diff --git a/verl/workers/config/rollout.py b/verl/workers/config/rollout.py
+index fa8441c7..bc115b43 100644
+--- a/verl/workers/config/rollout.py
++++ b/verl/workers/config/rollout.py
+@@ -42,6 +42,7 @@ class SamplingConfig(BaseConfig):
+     top_p: float = 1.0
+     do_sample: bool = True
+     n: int = 1
++    presence_penalty: float = 0.0
+ 
+ 
+ @dataclass
+@@ -166,6 +167,11 @@ class RolloutConfig(BaseConfig):
+     do_sample: bool = True
+     n: int = 1
+     repetition_penalty: float = 1.0
++    # sent with every request (training and validation); stop_token_ids None = model generation_config
++    presence_penalty: float = 0.0
++    stop_token_ids: Optional[list[int]] = None
++    # zero response_mask of truncated responses (V1 trainer agent loop postprocess)
++    mask_truncated_responses: bool = False
+ 
+     # Whether to enable full determinism for reproducibility.
+     full_determinism: bool = False
+diff --git a/verl/workers/engine/base.py b/verl/workers/engine/base.py
+index 161faed0..75529b29 100644
+--- a/verl/workers/engine/base.py
++++ b/verl/workers/engine/base.py
+@@ -320,10 +320,15 @@ class BaseEngineCtx:
+         if self.mode == "eval":
+             self.engine.to(device=device, model=self.engine.is_param_offload_enabled, optimizer=False, grad=False)
+         elif self.mode == "train":
++            # engines with defer_optimizer_load keep an offloaded optimizer on CPU through forward/backward
++            # and load it inside optimizer_step (Adam state is not needed before the step).
++            load_optimizer = self.engine.is_optimizer_offload_enabled and not (
++                device != "cpu" and getattr(self.engine, "defer_optimizer_load", False)
++            )
+             self.engine.to(
+                 device=device,
+                 model=self.engine.is_param_offload_enabled,
+-                optimizer=self.engine.is_optimizer_offload_enabled,
++                optimizer=load_optimizer,
+                 grad=self.engine.is_param_offload_enabled,
+             )
+ 
+diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
+index c5cbc35d..1b90b990 100644
+--- a/verl/workers/engine/fsdp/transformer_impl.py
++++ b/verl/workers/engine/fsdp/transformer_impl.py
+@@ -197,6 +197,12 @@ class FSDPEngine(BaseEngine):
+     def is_optimizer_offload_enabled(self) -> bool:
+         return self._is_offload_optimizer
+ 
++    @property
++    def defer_optimizer_load(self) -> bool:
++        # with optimizer_offload, load the optimizer state only around optimizer.step(): keeping Adam
++        # (2 x fp32 shard) on the GPU through forward/backward defeats the offload (9B on 3 ranks: +25.7 GB/GPU).
++        return bool(getattr(self, "_is_offload_optimizer", False)) and not getattr(self.engine_config, "forward_only", False)
++
+     def is_mp_src_rank_with_outputs(self):
+         if self.ulysses_device_mesh is not None:
+             is_collect = self.ulysses_device_mesh["sp"].get_local_rank() == 0
+@@ -814,6 +820,9 @@ class FSDPEngine(BaseEngine):
+         if isinstance(grad_norm, DTensor):
+             grad_norm = grad_norm.full_tensor()
+ 
++        if self.defer_optimizer_load:
++            load_fsdp_optimizer(self.optimizer, get_device_id())
++
+         if scaler is not None:
+             # scaler handles inf/nan skipping internally via _check_inf_per_device.
+             scaler.step(self.optimizer)
+@@ -826,6 +835,9 @@ class FSDPEngine(BaseEngine):
+             else:
+                 self.optimizer.step()
+ 
++        if self.defer_optimizer_load:
++            offload_fsdp_optimizer(self.optimizer)
++
+         if self._qat_enabled:
+             from verl.utils.qat.core import invalidate_all_scales
+ 
+@@ -1423,7 +1435,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
+                 if not distillation_only:
+                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
+                     inplace_backward = True
+-                    if calculate_entropy:
++                    if calculate_entropy or distillation_use_topk:
++                        # top-k distillation keeps logits_rmpad for its own backward: no in-place CE grad
+                         inplace_backward = False
+                     log_probs = logprobs_from_logits(
+                         logits=logits_rmpad,
+diff --git a/verl/workers/rollout/llm_server.py b/verl/workers/rollout/llm_server.py
+index a5c57318..003fe798 100644
+--- a/verl/workers/rollout/llm_server.py
++++ b/verl/workers/rollout/llm_server.py
+@@ -315,6 +315,8 @@ class FullyAsyncLLMServerClient(LLMServerClient):
+             if output.num_preempted is not None:
+                 final_output.num_preempted += output.num_preempted
+             final_output.stop_reason = output.stop_reason
++            # backend finish reason (vLLM: extra_fields; SGLang: stop_reason carries it)
++            final_output.extra_fields["finish_reason"] = output.extra_fields.get("finish_reason", output.stop_reason)
+ 
+             # carry the initial prefill's prefix-cache hit count forward
+             if num_cached_tokens is None:
+@@ -331,6 +333,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
+                 sampling_params[limit_key] = original_max_tokens - len(final_output.token_ids)
+                 if len(final_output.token_ids) >= original_max_tokens:
+                     final_output.stop_reason = "length"
++                    final_output.extra_fields["finish_reason"] = "length"
+                     break
+ 
+             # 4. check stop reason
+diff --git a/verl/workers/rollout/utils.py b/verl/workers/rollout/utils.py
+index 06a1daef..98824218 100644
+--- a/verl/workers/rollout/utils.py
++++ b/verl/workers/rollout/utils.py
+@@ -14,6 +14,8 @@
+ import asyncio
+ import logging
+ import os
++import re
++from typing import Optional
+ 
+ import numpy as np
+ import ray
+@@ -109,11 +111,78 @@ def qwen2_5_vl_dedup_image_tokens(prompt_ids: list[int], processor):
+         mask = np.ones(len(prompt_ids), dtype=bool)
+         is_value = (prompt_ids == processor.image_token_id) | (prompt_ids == processor.video_token_id)
+         mask[1:] &= ~(is_value[1:] & is_value[:-1])
+-        return prompt_ids[mask].tolist()
++        return _collapse_timestamped_videos(prompt_ids[mask].tolist(), processor)
+     else:
+         return prompt_ids
+ 
+ 
++_VIDEO_TIMESTAMP = re.compile(r"<(\d+(?:\.\d+)?) seconds>")
++_VIDEO_TIMESTAMP_PREFIXED = re.compile(r"(.*?)<(\d+(?:\.\d+)?) seconds>", re.DOTALL)
++_MAX_TIMESTAMP_TOKENS = 16
++
++
++def _timestamp_before(ids: list[int], end: int, start: int, tokenizer) -> tuple[int, Optional[float], str]:
++    """(length, value, prefix) of the `<t seconds>` token span ending at `end` (not before `start`).
++    `prefix` is text BPE-merged into the span's first token (e.g. ":<"); (0, None, "") if no timestamp."""
++    for k in range(1, min(_MAX_TIMESTAMP_TOKENS, end - start) + 1):
++        m = _VIDEO_TIMESTAMP_PREFIXED.fullmatch(tokenizer.decode(ids[end - k : end]))
++        if m:
++            return k, float(m.group(2)), m.group(1)
++    return 0, None, ""
++
++
++def _collapse_timestamped_videos(ids: list[int], processor) -> list[int]:
++    """Qwen3-VL / Qwen3.5 processors expand each video into per-frame blocks
++    `<t0 seconds><|vision_start|><|video_pad|>..<|vision_end|><t1 seconds>...`, but vLLM's prompt update
++    replaces only ONE `<|vision_start|><|video_pad|><|vision_end|>` per video with the full per-frame
++    expansion. After the pad dedup above, the other frames' blocks would stay in the prompt as text, so
++    vLLM saw a longer, corrupted video prompt (teacher prompt_logprobs length != sequence length).
++    Collapse each video's timestamped frame run back to `<|vision_start|><|video_pad|><|vision_end|>`.
++    Prompts without timestamped frames (Qwen2/2.5-VL, images) are returned unchanged.
++    """
++    tokenizer = getattr(processor, "tokenizer", None)
++    video_id = getattr(processor, "video_token_id", None)
++    if tokenizer is None or video_id is None:
++        return ids
++    vs = tokenizer.convert_tokens_to_ids("<|vision_start|>")
++    ve = tokenizer.convert_tokens_to_ids("<|vision_end|>")
++    if not isinstance(vs, int) or not isinstance(ve, int):
++        return ids
++
++    def is_block(i):
++        return i + 2 < len(ids) and ids[i] == vs and ids[i + 1] == video_id and ids[i + 2] == ve
++
++    out, i, done = [], 0, 0  # done = first index of ids not yet consumed by a collapsed group
++    while i < len(ids):
++        if is_block(i):
++            k, t_prev, prefix = _timestamp_before(ids, i, done, tokenizer)
++            if k:
++                j = i + 3
++                # absorb the following frames of the same video: timestamps never decrease within a video
++                # (%.1f rounding can repeat one); a drop starts a new video. Ambiguous only for directly
++                # adjacent videos whose first one ends before the next one's first timestamp (<~1 s clips).
++                while True:
++                    nxt = None
++                    for k2 in range(1, _MAX_TIMESTAMP_TOKENS + 1):
++                        if is_block(j + k2):
++                            m = _VIDEO_TIMESTAMP.fullmatch(tokenizer.decode(ids[j : j + k2]))
++                            if m and float(m.group(1)) >= t_prev:
++                                nxt = (k2, float(m.group(1)))
++                            break
++                    if nxt is None:
++                        break
++                    j, t_prev = j + nxt[0] + 3, nxt[1]
++                del out[len(out) - k :]
++                if prefix:  # best effort: vLLM's expansion re-tokenizes this boundary, lengths may differ
++                    out.extend(tokenizer.encode(prefix, add_special_tokens=False))
++                out.extend((vs, video_id, ve))
++                i = done = j
++                continue
++        out.append(ids[i])
++        i += 1
++    return out
++
++
+ def get_vision_placeholder_token_ids(processor) -> list[int]:
+     """Vision placeholder token ids the policy must never sample.
+ 
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index 068a4690..b4e14302 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -725,6 +725,9 @@ class vLLMHttpServer:
+         else:
+             stop_reason = finish_reason  # for more stop reason in the future
+ 
++        # raw backend finish reason (stop_reason folds "length" into "completed")
++        extra_fields["finish_reason"] = finish_reason
++
+         num_preempted = None
+ 
+         if hasattr(final_res.outputs[0], "num_preempted"):
